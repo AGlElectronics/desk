@@ -1,0 +1,112 @@
+# Desk — standalone Docker Compose stack for Docker Desktop.
+#
+# Container ports:
+#   Every module in this ecosystem binds :8080 inside its container.
+#   The HOST port for Desk is 8150 (API) and 3008 (SPA). Mapping below.
+#
+# No object storage: Desk stores no files in this slice (pages are text in
+# Postgres). When uploads land, wire MinIO here the way Rally does — and
+# remember MinIO is LOCAL DEV ONLY, never production.
+#
+# Migrations: the `migrate` service is a ONE-SHOT. The backend depends on
+# it with service_completed_successfully so cmd/server never runs
+# migrations itself.
+#
+# Reserved HOST ports (Desk module):
+#   backend   : 8150  (container :8080)
+#   frontend  : 3008  (container :80)
+#   postgres  : 5440  (container :5432)
+
+name: desk
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: desk-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: desk
+      POSTGRES_PASSWORD: desk
+      POSTGRES_DB: desk
+    ports:
+      - "5440:5432"
+    volumes:
+      - desk-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U desk -d desk"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot migrator. Exits zero on success; the backend waits for that.
+  migrate:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.migrate
+    container_name: desk-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgres://desk:desk@postgres:5432/desk?sslmode=disable
+    restart: "no"
+
+  backend:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.backend
+    container_name: desk-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: development
+      # Browser-facing base URL uses the HOST port so links in logs /
+      # dev tooling point at something a human can click.
+      APP_BASE_URL: http://localhost:8150
+      # Container binds :8080 (ecosystem convention). Compose maps 8150 -> 8080.
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://desk:desk@postgres:5432/desk?sslmode=disable
+      # Auth: dev = X-Dev-User / X-Dev-Groups headers; oidc = verify Bearer JWT.
+      AUTH_MODE: ${AUTH_MODE:-dev}
+      DEV_DEFAULT_USER: dev-admin
+      DEV_DEFAULT_GROUPS: desk-admin
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+      ACCESS_CONFIG_PATH: /etc/desk/access-config.toml
+      # Pairing with Den happens in the app (Settings → Den connection).
+      # Set this when the pairing URL Den shows is not reachable from here.
+      DEN_INTERNAL_URL: ${DEN_INTERNAL_URL:-}
+      # CORS only matters for `npm run dev` on the host — in prod the SPA
+      # talks to /api via the nginx reverse proxy on the same origin.
+      CORS_ALLOWED_ORIGINS: http://localhost:3008
+    volumes:
+      - ./access-config.toml:/etc/desk/access-config.toml:ro
+    ports:
+      - "8150:8080"
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.frontend
+      args:
+        VITE_AUTH_MODE: ${VITE_AUTH_MODE:-dev}
+        VITE_OIDC_AUTHORITY: ${VITE_OIDC_AUTHORITY:-}
+        VITE_OIDC_CLIENT_ID: ${VITE_OIDC_CLIENT_ID:-}
+        VITE_OIDC_SCOPE: ${VITE_OIDC_SCOPE:-openid profile email}
+        VITE_PRODUCT_NAME: ${VITE_PRODUCT_NAME:-Desk}
+        DESK_VERSION: ${DESK_VERSION:-dev}
+    container_name: desk-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3008:80"
+
+volumes:
+  desk-postgres-data:

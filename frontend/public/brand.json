@@ -1,0 +1,16 @@
+{
+  "revision": 1,
+  "source": "standalone",
+  "productName": "Desk",
+  "organizationName": "",
+  "loginSubtitle": "Support inboxes & tickets",
+  "loginButtonLabel": "Continue with your organisation login",
+  "logoUrl": "",
+  "themeColor": "#18181b",
+  "colors": {
+    "primary": "#4f46e5",
+    "carbon": "#18181b",
+    "shadow": "#241e20"
+  },
+  "cssVariables": {}
+}

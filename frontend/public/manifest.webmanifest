@@ -1,0 +1,9 @@
+{
+  "name": "Desk — Support inboxes",
+  "short_name": "Desk",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#18181b",
+  "theme_color": "#18181b",
+  "icons": []
+}

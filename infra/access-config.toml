@@ -1,0 +1,52 @@
+# Desk access configuration.
+#
+# This TOML file is the single source of truth for the role → permission
+# catalog and the OIDC-group → role bindings. It is read once at startup;
+# restart the backend after editing.
+#
+# Permission reference — add new names in internal/domain/domain.go,
+# otherwise the loader rejects them.
+#
+#   Tickets:    tickets.work    (read and work conversations in every mailbox)
+#   Mailboxes:  mailbox.manage  (create/edit mailboxes, IMAP/SMTP settings)
+#   Settings:   settings.manage (Den pairing, module settings)
+#
+# A role listed here replaces its built-in permission set entirely.
+#
+# MVP: agents see every mailbox. Per-mailbox grants come later
+# (docs/plan.md, "Access model").
+
+# Organization (slug) that bindings grant roles in, unless a binding sets
+# its own `organization`.
+organization = "demo-org"
+
+# -------------------------------------------------------------------------
+# Roles
+# -------------------------------------------------------------------------
+
+[roles.organization_admin]
+description = "Manages mailboxes, every conversation and the module settings."
+permissions = [
+  "tickets.work",
+  "mailbox.manage",
+  "settings.manage",
+]
+
+[roles.agent]
+description = "Answers support conversations: reply, note, assign, close."
+permissions = [
+  "tickets.work",
+]
+
+# -------------------------------------------------------------------------
+# OIDC group → role bindings (organization-wide, evaluated per request:
+# removing someone from the group revokes the role on their next request)
+# -------------------------------------------------------------------------
+
+[[bindings]]
+group = "desk-admin"
+role = "organization_admin"
+
+[[bindings]]
+group = "desk-agent"
+role = "agent"
