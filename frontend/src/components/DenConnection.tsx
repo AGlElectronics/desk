@@ -15,7 +15,7 @@ type DenStatus = {
  * Pairing with Den. Paired: brand and organisation settings come from Den.
  * Standalone: this module's own settings apply.
  */
-export function DenConnection({ base }: { base: string }) {
+export function DenConnection({ base, onPaired }: { base: string; onPaired?: () => void }) {
   const qc = useQueryClient();
   const status = useQuery({ queryKey: ['den-status'], queryFn: () => apiRequest<DenStatus>(`${base}/`) });
   const [url, setUrl] = useState('');
@@ -29,6 +29,7 @@ export function DenConnection({ base }: { base: string }) {
     onSuccess: () => {
       setUrl('');
       refresh();
+      onPaired?.();
     },
   });
   const sync = useMutation({ mutationFn: () => apiRequest<DenStatus>(`${base}/sync`, { method: 'POST' }), onSettled: refresh });

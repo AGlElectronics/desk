@@ -2,6 +2,9 @@
 // brand and organisation settings. It is identical in every Con Services
 // module (HR, Stash, Rally, Desk); keep the copies in sync.
 //
+// With DEN_MODE=required (Config.Mode) the module refuses its API with 503
+// den_pairing_required until it is paired; see RequirePaired.
+//
 // Flow: an admin mints a pairing URL in Den (Admin → Modules) and pastes it
 // into this module. The backend redeems it for a long-lived module
 // credential, stores it in the module's own database (table den_link), and
@@ -60,6 +63,28 @@ type Status struct {
 	LastError  string     `json:"last_error,omitempty"`
 }
 
+// Mode is DEN_MODE: whether the module may serve its API before it is
+// paired with Den.
+type Mode string
+
+const (
+	// ModeStandalone serves the API whether or not the module is paired.
+	ModeStandalone Mode = "standalone"
+	// ModeRequired answers 503 den_pairing_required until the module is
+	// paired (see RequirePaired).
+	ModeRequired Mode = "required"
+)
+
+// Validate rejects anything but required and standalone. The empty Mode
+// means standalone.
+func (m Mode) Validate() error {
+	switch m {
+	case "", ModeStandalone, ModeRequired:
+		return nil
+	}
+	return fmt.Errorf("DEN_MODE must be %q or %q, got %q", ModeRequired, ModeStandalone, string(m))
+}
+
 // Config wires a Client.
 type Config struct {
 	// Slug and Version are sent to Den when redeeming a pairing URL.
@@ -68,6 +93,8 @@ type Config struct {
 	// URLs (e.g. http://den-backend:8080 inside Docker, where the URL Den
 	// shows the admin is not reachable).
 	InternalURL string
+	// Mode is DEN_MODE; empty means standalone.
+	Mode Mode
 }
 
 // Asset roles the module copies from Den and serves itself.
@@ -94,6 +121,8 @@ type Client struct {
 	mu     sync.RWMutex
 	bundle *Bundle
 	assets map[string]asset
+	// linked mirrors whether the den_link row exists.
+	linked bool
 }
 
 // New returns a Client; call Run to start syncing.
@@ -118,22 +147,45 @@ func (c *Client) load(ctx context.Context) (*link, error) {
 		SELECT den_base_url, credential, module_id, paired_at, synced_at, last_error, bundle
 		  FROM den_link WHERE id = 1`).Scan(&l.baseURL, &l.credential, &l.moduleID, &l.pairedAt, &l.syncedAt, &l.lastError, &l.bundle)
 	if errors.Is(err, pgx.ErrNoRows) {
+		c.setLinked(false)
 		return nil, nil
 	}
-	return &l, err
+	if err != nil {
+		return nil, err
+	}
+	c.setLinked(true)
+	return &l, nil
 }
 
-// Run restores the cached bundle and syncs every SyncInterval until ctx ends.
-func (c *Client) Run(ctx context.Context) {
-	if l, err := c.load(ctx); err != nil {
-		c.log.Warn().Err(err).Msg("den link: load failed")
-	} else if l != nil && len(l.bundle) > 0 {
+func (c *Client) setLinked(v bool) {
+	c.mu.Lock()
+	c.linked = v
+	c.mu.Unlock()
+}
+
+// Restore loads the pairing state and the cached bundle from the database.
+// Call it before serving requests so RequirePaired sees the stored pairing;
+// Run calls it too.
+func (c *Client) Restore(ctx context.Context) error {
+	l, err := c.load(ctx)
+	if err != nil {
+		return err
+	}
+	if l != nil && len(l.bundle) > 0 {
 		var b Bundle
 		if json.Unmarshal(l.bundle, &b) == nil {
 			c.mu.Lock()
 			c.bundle = &b
 			c.mu.Unlock()
 		}
+	}
+	return nil
+}
+
+// Run restores the cached bundle and syncs every SyncInterval until ctx ends.
+func (c *Client) Run(ctx context.Context) {
+	if err := c.Restore(ctx); err != nil {
+		c.log.Warn().Err(err).Msg("den link: load failed")
 	}
 	t := time.NewTicker(SyncInterval)
 	defer t.Stop()
@@ -181,6 +233,15 @@ func (c *Client) OrganizationName() string {
 
 // Paired reports whether the module currently follows Den.
 func (c *Client) Paired() bool { return c.Bundle() != nil }
+
+// Linked reports whether the module holds a pairing (the den_link row
+// exists), even before the first sync or after Den rejected the credential.
+// It reads a cached flag kept current by Restore, Pair, Unpair and Sync.
+func (c *Client) Linked() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.linked
+}
 
 // Status reports the pairing state.
 func (c *Client) Status(ctx context.Context) (Status, error) {
@@ -233,6 +294,7 @@ func (c *Client) Pair(ctx context.Context, pairingURL string) (Status, error) {
 		base, out.Credential, out.ModuleID); err != nil {
 		return Status{}, err
 	}
+	c.setLinked(true)
 	if err := c.Sync(ctx); err != nil {
 		c.log.Warn().Err(err).Msg("den link: first sync failed")
 	}
@@ -245,7 +307,7 @@ func (c *Client) Unpair(ctx context.Context) error {
 		return err
 	}
 	c.mu.Lock()
-	c.bundle, c.assets = nil, map[string]asset{}
+	c.bundle, c.assets, c.linked = nil, map[string]asset{}, false
 	c.mu.Unlock()
 	return nil
 }
@@ -545,6 +607,61 @@ func (c *Client) AssetHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", ctype)
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	_, _ = w.Write(a.data)
+}
+
+// State is the public GET /api/den/state response.
+type State struct {
+	Mode   Mode `json:"mode"`
+	Paired bool `json:"paired"`
+}
+
+// StateHandler serves State without authentication so a frontend can show
+// a "waiting for Den" screen before anyone signs in.
+func (c *Client) StateHandler(w http.ResponseWriter, r *http.Request) {
+	mode := c.cfg.Mode
+	if mode == "" {
+		mode = ModeStandalone
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, State{Mode: mode, Paired: c.Linked()})
+}
+
+// pairingExempt are the API paths (and everything below them) that stay
+// open while RequirePaired blocks: health, brand, sign-in and the Den
+// connection routes an admin needs to pair. Modules serve either /api or
+// /api/v1, and Rally its submission site under /api/public/v1.
+var pairingExempt = []string{
+	"/api/health",
+	"/api/role-catalog",
+	"/api/brand",
+	"/api/me",
+	"/api/den",
+	"/api/v1/brand",
+	"/api/v1/me",
+	"/api/v1/den",
+	"/api/public/v1/brand",
+}
+
+func isPairingExempt(path string) bool {
+	for _, p := range pairingExempt {
+		if path == p || strings.HasPrefix(path, p+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// RequirePaired answers 503 den_pairing_required while Mode is required and
+// the module is not paired, except for the paths in pairingExempt. Mount it
+// first on the module's /api router.
+func (c *Client) RequirePaired(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if c.cfg.Mode != ModeRequired || c.Linked() || isPairingExempt(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, "den_pairing_required", "This module is waiting to be connected to Den.")
+	})
 }
 
 // Routes for admins: GET status, POST pair, POST sync, DELETE unpair.

@@ -13,6 +13,15 @@ the same version. Rebuilds get no entry here.
 
 ### Added
 
+- `DEN_MODE=required` keeps the module locked until it is paired with Den:
+  the API answers `503 den_pairing_required` (except health, brand, sign-in
+  and the Den connection routes) and the new public
+  `GET /api/den/state` (also at `/api/v1/den/state`) reports
+  `{"mode","paired"}`. The default `standalone` keeps today's behaviour; any
+  other value stops the backend at startup.
+- The web app shows a "Connect this module to Den" page (admins) or
+  "Waiting for Den" (everyone else) while the backend runs with
+  `DEN_MODE=required` and is not paired yet.
 - `TRUSTED_PROXY_CIDRS` (optional): comma-separated CIDRs of the proxies in
   front of the backend whose `X-Forwarded-For` entries are believed. The
   default, `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8,::1/128,fc00::/7`,
