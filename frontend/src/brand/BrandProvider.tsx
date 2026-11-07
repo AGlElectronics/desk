@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useMemo, type ReactNode } from 'r
 import { useQuery } from '@tanstack/react-query';
 import { getBrand, type ApiBrand } from '@/api/brand';
 import { brandCss } from '@/lib/moduleBrand';
+import { runtimeConfig } from '@/runtime-config';
 
 export type Brand = Required<Pick<ApiBrand, 'productName'>> & ApiBrand;
 
@@ -16,7 +17,7 @@ type Ctx = {
 const fallback: Brand = {
   revision: 0,
   source: 'standalone',
-  productName: (import.meta.env.VITE_PRODUCT_NAME as string | undefined) || 'Desk',
+  productName: runtimeConfig().productName || 'Desk',
   organizationName: '',
   loginSubtitle: 'Support inboxes & tickets',
   loginButtonLabel: 'Continue with your organisation login',

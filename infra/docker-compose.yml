@@ -5,8 +5,8 @@
 #   The HOST port for Desk is 8150 (API) and 3008 (SPA). Mapping below.
 #
 # No object storage: Desk stores no files in this slice (pages are text in
-# Postgres). When uploads land, wire MinIO here the way Rally does — and
-# remember MinIO is LOCAL DEV ONLY, never production.
+# Postgres). When uploads land, wire an s3 service here the way Rally does —
+# and remember it is LOCAL DEV ONLY, never production.
 #
 # Migrations: the `migrate` service is a ONE-SHOT. The backend depends on
 # it with service_completed_successfully so cmd/server never runs
@@ -85,6 +85,7 @@ services:
       # CORS only matters for `npm run dev` on the host — in prod the SPA
       # talks to /api via the nginx reverse proxy on the same origin.
       CORS_ALLOWED_ORIGINS: http://localhost:3008
+      TRUSTED_PROXY_CIDRS: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8,::1/128,fc00::/7"
     volumes:
       - ./access-config.toml:/etc/desk/access-config.toml:ro
     ports:
@@ -95,18 +96,17 @@ services:
       context: ..
       dockerfile: infra/Dockerfile.frontend
       args:
-        VITE_AUTH_MODE: ${VITE_AUTH_MODE:-dev}
-        VITE_OIDC_AUTHORITY: ${VITE_OIDC_AUTHORITY:-}
-        VITE_OIDC_CLIENT_ID: ${VITE_OIDC_CLIENT_ID:-}
-        VITE_OIDC_SCOPE: ${VITE_OIDC_SCOPE:-openid profile email}
-        VITE_PRODUCT_NAME: ${VITE_PRODUCT_NAME:-Desk}
         DESK_VERSION: ${DESK_VERSION:-dev}
     container_name: desk-frontend
+    volumes:
+      # Web app settings (/config.json). Dev sign-in by default; for real
+      # sign-in set FRONTEND_CONFIG to your own file (docs: configuration).
+      - ${FRONTEND_CONFIG:-./frontend-config/compose.json}:/etc/conservices/config.json:ro
     restart: unless-stopped
     depends_on:
       - backend
     ports:
-      - "3008:80"
+      - "3008:8080"
 
 volumes:
   desk-postgres-data:

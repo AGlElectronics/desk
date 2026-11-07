@@ -1,0 +1,8 @@
+{
+  "authMode": "dev",
+  "oidcAuthority": "",
+  "oidcClientId": "",
+  "oidcScope": "openid profile email",
+  "apiBaseUrl": "",
+  "productName": "Desk"
+}

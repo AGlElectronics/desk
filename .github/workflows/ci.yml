@@ -1,0 +1,50 @@
+# CI on pull requests and main; signed multi-arch images on vX.Y.Z tags.
+# The pipeline itself lives in AGlElectronics/con-services; see
+# https://aglelectronics.github.io/con-services/contributing/ci/
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to rebuild, for example 1.0.0 (the tag v1.0.0 must exist). Publishes the next BUILD number.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch') && 'release' || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    # Pinned to a tag so changes to the shared pipeline are adopted on purpose.
+    uses: AGlElectronics/con-services/.github/workflows/module-ci.yml@ci-v1
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+      packages: write
+      id-token: write
+    with:
+      module: desk
+      push: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
+      version: ${{ inputs.version }}
+      # Self-hosted runners (ARC scale set). On GitHub-hosted runners use:
+      # runner: ubuntu-24.04, buildkit-endpoint: "", test-database-mode: service
+      runner: arc-conservices
+      images: >-
+        [
+          {"name": "backend", "dockerfile": "infra/Dockerfile.backend",
+           "build-args": ["VERSION={version}"], "shell-less": true},
+          {"name": "migrate", "dockerfile": "infra/Dockerfile.migrate", "shell-less": true},
+          {"name": "frontend", "dockerfile": "infra/Dockerfile.frontend",
+           "build-args": ["DESK_VERSION={version}"],
+           "allow-root": false}
+        ]
