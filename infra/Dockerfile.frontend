@@ -32,7 +32,7 @@ RUN npm run build
 # a non-root process cannot bind ports below 1024. The pid file and the
 # temporary files live in /tmp. The upgrade picks up Alpine security fixes
 # published after the base image was built.
-FROM nginxinc/nginx-unprivileged:1.30.6-alpine AS runtime
+FROM nginxinc/nginx-unprivileged:1.31.7-alpine AS runtime
 USER root
 RUN apk upgrade --no-cache
 COPY --from=build /src/dist /usr/share/nginx/html
