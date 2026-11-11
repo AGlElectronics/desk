@@ -11,12 +11,9 @@ import (
 	"errors"
 	"fmt"
 	nethttp "net/http"
-	"os"
-	"os/signal"
-	"syscall"
+	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 
 	"github.com/AGlElectronics/desk/backend/internal/auth"
@@ -98,8 +95,16 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		Username: cfg.SMTPUsername, Password: cfg.SMTPPassword,
 	})
 	// One replica: the fetcher assumes nobody else polls the same mailboxes.
-	go deskSvc.RunFetcher(ctx, cfg.FetchInterval, logger)
-	go deskSvc.RunSender(ctx, logger)
+	// The workers stop before the pool closes (see runServer).
+	workCtx, stopWork := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopWork()
+	var workers sync.WaitGroup
+	workers.Go(func() { deskSvc.RunFetcher(workCtx, cfg.FetchInterval, logger) })
+	workers.Go(func() { deskSvc.RunSender(workCtx, logger) })
+	stopWorkers := func() {
+		stopWork()
+		workers.Wait()
+	}
 
 	router := httpx.NewRouter(httpx.Deps{
 		Desk:         deskSvc,
@@ -122,13 +127,13 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		return fmt.Errorf("tls: %w", err)
 	}
 
-	return runServer(ctx, server, pool, cfg.ShutdownTimeout, logger)
+	return runServer(ctx, server, stopWorkers, cfg.ShutdownTimeout, logger)
 }
 
-func runServer(ctx context.Context, server *nethttp.Server, pool *pgxpool.Pool, shutdownTimeout time.Duration, logger zerolog.Logger) error {
-	signalCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
+// runServer serves until ctx is cancelled (SIGINT/SIGTERM in cmd/server),
+// then drains HTTP requests and stops the background workers. The caller
+// closes the database pool afterwards, so no worker writes to a closed pool.
+func runServer(ctx context.Context, server *nethttp.Server, stopWorkers func(), shutdownTimeout time.Duration, logger zerolog.Logger) error {
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info().Str("addr", server.Addr).Msg("http listening")
@@ -138,20 +143,31 @@ func runServer(ctx context.Context, server *nethttp.Server, pool *pgxpool.Pool, 
 		close(errCh)
 	}()
 
+	var serveErr error
 	select {
-	case err := <-errCh:
-		return err
-	case <-signalCtx.Done():
+	case serveErr = <-errCh:
+	case <-ctx.Done():
 		logger.Info().Msg("shutdown signal received")
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.Error().Err(err).Msg("http shutdown error")
+	if serveErr == nil {
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			logger.Error().Err(err).Msg("http shutdown error")
+		}
 	}
-	pool.Close()
+	done := make(chan struct{})
+	go func() {
+		stopWorkers()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-shutdownCtx.Done():
+		logger.Warn().Msg("background workers did not stop within SHUTDOWN_TIMEOUT")
+	}
 	logger.Info().Msg("shutdown complete")
-	return nil
+	return serveErr
 }

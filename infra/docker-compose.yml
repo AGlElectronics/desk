@@ -1,21 +1,26 @@
-# Desk — standalone Docker Compose stack for Docker Desktop.
+# Desk — standalone Docker Compose stack for Docker Desktop. LOCAL DEV ONLY.
 #
 # Container ports:
 #   Every module in this ecosystem binds :8080 inside its container.
 #   The HOST port for Desk is 8150 (API) and 3008 (SPA). Mapping below.
 #
-# No object storage: Desk stores no files in this slice (pages are text in
-# Postgres). When uploads land, wire an s3 service here the way Rally does —
-# and remember it is LOCAL DEV ONLY, never production.
+# Dev mail: GreenMail holds real mailboxes Desk reads over IMAP
+# (greenmail:3143) and accepts SMTP (greenmail:3025) for replies, so a
+# whole round trip works without an outside mail server. Attachments and
+# raw mail go to SeaweedFS (S3 API on :9000). Every password here is a
+# development value; production uses a managed S3 service and real secrets
+# from a secret manager (https://aglelectronics.github.io/con-services/operations/secrets/).
 #
 # Migrations: the `migrate` service is a ONE-SHOT. The backend depends on
 # it with service_completed_successfully so cmd/server never runs
 # migrations itself.
 #
 # Reserved HOST ports (Desk module):
-#   backend   : 8150  (container :8080)
-#   frontend  : 3008  (container :80)
-#   postgres  : 5440  (container :5432)
+#   backend    : 8150  (container :8080)
+#   frontend   : 3008  (container :8080)
+#   postgres   : 5440  (container :5432)
+#   s3         : 9040  (container :9000)
+#   greenmail  : 3025 SMTP, 3143 IMAP, 3993 IMAPS
 
 name: desk
 
@@ -37,6 +42,54 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # LOCAL DEV ONLY S3-compatible storage (SeaweedFS "mini"): bucket
+  # desk-data-dev is created on start, DEV key desk / deskdev.
+  s3:
+    image: chrislusf/seaweedfs:4.52
+    container_name: desk-s3
+    restart: unless-stopped
+    command:
+      - mini
+      - -dir=/data
+      - -s3.port=9000
+      - -bucket=desk-data-dev
+      - -master.telemetry=false
+      - -admin.ui=false
+      - -webdav=false
+      - -s3.port.iceberg=0
+      - -s3.port.lance=0
+    environment:
+      AWS_ACCESS_KEY_ID: desk
+      AWS_SECRET_ACCESS_KEY: deskdev
+    ports:
+      - "9040:9000"
+    volumes:
+      - desk-s3-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:9000/healthz && wget -q --spider http://127.0.0.1:8888/buckets/desk-data-dev/"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # DEV ONLY mail server. Mail sent to any address over SMTP is delivered;
+  # these mailboxes can log in over IMAP (login = full address, password =
+  # the part before the @): support@desk.test, registration@desk.test.
+  greenmail:
+    image: greenmail/standalone:latest
+    container_name: desk-greenmail
+    restart: unless-stopped
+    environment:
+      GREENMAIL_OPTS: >-
+        -Dgreenmail.setup.test.all
+        -Dgreenmail.hostname=0.0.0.0
+        -Dgreenmail.users=support:support@desk.test,registration:registration@desk.test
+        -Dgreenmail.users.login=email
+    ports:
+      - "3025:3025"
+      - "3143:3143"
+      - "3993:3993"
 
   # One-shot migrator. Exits zero on success; the backend waits for that.
   migrate:
@@ -63,6 +116,10 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      s3:
+        condition: service_healthy
+      greenmail:
+        condition: service_started
     environment:
       APP_ENV: development
       # Browser-facing base URL uses the HOST port so links in logs /
@@ -86,6 +143,28 @@ services:
       # talks to /api via the nginx reverse proxy on the same origin.
       CORS_ALLOWED_ORIGINS: http://localhost:3008
       TRUSTED_PROXY_CIDRS: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8,::1/128,fc00::/7"
+      # DEV ONLY: encrypts stored mailbox passwords. Production: a long
+      # random secret from your secret manager.
+      DESK_SECRET_KEY: desk-dev-secret-key-change-me-0123456789
+      FETCH_INTERVAL: 20s
+      # GreenMail runs on a private Docker address, which Desk blocks for
+      # mailbox hosts unless it is listed here.
+      DESK_ALLOWED_MAIL_HOSTS: greenmail
+      # Module-wide SMTP for mailboxes without their own SMTP server, and for
+      # notifications. Plaintext is accepted only because APP_ENV=development.
+      SMTP_HOST: greenmail
+      SMTP_PORT: "3025"
+      SMTP_SECURITY: none
+      NOTIFY_FROM: "Desk <desk@desk.test>"
+      # Try the Google Workspace flow without Google (in-memory, DEV ONLY).
+      GOOGLE_WORKSPACE_DOMAIN: ${GOOGLE_WORKSPACE_DOMAIN:-}
+      GOOGLE_SHARED_MAILBOX: ${GOOGLE_SHARED_MAILBOX:-}
+      GOOGLE_FAKE: ${GOOGLE_FAKE:-false}
+      S3_ENDPOINT: http://s3:9000
+      S3_BUCKET: desk-data-dev
+      S3_ACCESS_KEY_ID: desk
+      S3_SECRET_ACCESS_KEY: deskdev
+      S3_USE_PATH_STYLE: "true"
     volumes:
       - ./access-config.toml:/etc/desk/access-config.toml:ro
     ports:
@@ -110,3 +189,4 @@ services:
 
 volumes:
   desk-postgres-data:
+  desk-s3-data:

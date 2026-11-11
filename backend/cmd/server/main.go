@@ -8,6 +8,8 @@ package main
 import (
 	"context"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -23,7 +25,8 @@ func main() {
 		logger = logger.Output(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339})
 	}
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if err := app.Run(ctx, logger); err != nil {
 		logger.Fatal().Err(err).Msg("server failed")
 	}
