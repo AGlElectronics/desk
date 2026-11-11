@@ -7,14 +7,8 @@ package desk
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"net/mail"
 	"strings"
 	"time"
@@ -24,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AGlElectronics/desk/backend/internal/httperror"
+	"github.com/AGlElectronics/desk/backend/internal/secretbox"
 )
 
 // SMTPSettings is the module-wide fallback for mailboxes without their own
@@ -36,54 +31,124 @@ type SMTPSettings struct {
 	Password string
 }
 
+// Options configures a Service.
+type Options struct {
+	// Keyring seals mailbox passwords (DESK_SECRET_KEY and previous keys).
+	Keyring *secretbox.Keyring
+	// SMTP is the module-wide fallback server.
+	SMTP SMTPSettings
+	// Development unlocks plaintext mail connections (APP_ENV=development).
+	Development bool
+}
+
 // Service is safe for concurrent use.
 type Service struct {
 	pool *pgxpool.Pool
-	gcm  cipher.AEAD
+	keys *secretbox.Keyring
 	smtp SMTPSettings
+	dev  bool
 	// fetchNow wakes the fetcher early ("Fetch now" in the UI).
 	fetchNow chan uuid.UUID
 }
 
-// NewService constructs the helpdesk service. secretKey encrypts mailbox
-// passwords; any length works (it is hashed to an AES-256 key).
-func NewService(pool *pgxpool.Pool, secretKey string, smtp SMTPSettings) *Service {
-	key := sha256.Sum256([]byte(secretKey))
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		panic(err) // 32-byte key: cannot fail
+// NewService constructs the helpdesk service.
+func NewService(pool *pgxpool.Pool, opts Options) *Service {
+	if opts.Keyring == nil {
+		panic("desk: Options.Keyring is required")
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		panic(err)
+	return &Service{
+		pool: pool, keys: opts.Keyring, smtp: opts.SMTP, dev: opts.Development,
+		fetchNow: make(chan uuid.UUID, 16),
 	}
-	return &Service{pool: pool, gcm: gcm, smtp: smtp, fetchNow: make(chan uuid.UUID, 16)}
 }
 
-func (s *Service) encrypt(plain string) (string, error) {
-	if plain == "" {
-		return "", nil
-	}
-	nonce := make([]byte, s.gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(s.gcm.Seal(nonce, nonce, []byte(plain), nil)), nil
+// KeyID names the current DESK_SECRET_KEY (safe to log).
+func (s *Service) KeyID() string { return s.keys.CurrentKeyID() }
+
+// passwordAAD binds a sealed password to its mailbox and column.
+func passwordAAD(mailboxID uuid.UUID, column string) string {
+	return "mailbox:" + mailboxID.String() + ":" + column
 }
 
-func (s *Service) decrypt(enc string) (string, error) {
-	if enc == "" {
-		return "", nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(enc)
-	if err != nil || len(raw) < s.gcm.NonceSize() {
-		return "", errors.New("stored password is unreadable")
-	}
-	plain, err := s.gcm.Open(nil, raw[:s.gcm.NonceSize()], raw[s.gcm.NonceSize():], nil)
+func (s *Service) encrypt(mailboxID uuid.UUID, column, plain string) (string, error) {
+	return s.keys.Seal(plain, passwordAAD(mailboxID, column))
+}
+
+func (s *Service) decrypt(mailboxID uuid.UUID, column, enc string) (string, error) {
+	plain, err := s.keys.Open(enc, passwordAAD(mailboxID, column))
 	if err != nil {
-		return "", errors.New("stored password cannot be decrypted (was DESK_SECRET_KEY changed?)")
+		return "", errors.New("the stored password cannot be decrypted (DESK_SECRET_KEY changed without DESK_SECRET_KEY_PREVIOUS?); enter it again")
 	}
-	return string(plain), nil
+	return plain, nil
+}
+
+// ReencryptResult counts what Reencrypt did.
+type ReencryptResult struct {
+	Resealed int      `json:"resealed"`
+	Current  int      `json:"current"`
+	Failed   []string `json:"failed"`
+}
+
+// Reencrypt seals every stored mailbox password again under the current
+// key, so DESK_SECRET_KEY_PREVIOUS can be removed afterwards. Values no key
+// opens are reported and left alone.
+func (s *Service) Reencrypt(ctx context.Context) (ReencryptResult, error) {
+	res := ReencryptResult{Failed: []string{}}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return res, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	rows, err := tx.Query(ctx, `SELECT id, email::text, imap_password_enc, smtp_password_enc FROM mailboxes FOR UPDATE`)
+	if err != nil {
+		return res, err
+	}
+	type row struct {
+		id         uuid.UUID
+		email      string
+		imap, smtp string
+	}
+	var all []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.email, &r.imap, &r.smtp); err != nil {
+			rows.Close()
+			return res, err
+		}
+		all = append(all, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return res, err
+	}
+	for _, r := range all {
+		for _, col := range []struct {
+			name string
+			enc  string
+		}{{"imap_password", r.imap}, {"smtp_password", r.smtp}} {
+			if col.enc == "" {
+				continue
+			}
+			if !s.keys.NeedsReseal(col.enc) {
+				res.Current++
+				continue
+			}
+			plain, err := s.keys.Open(col.enc, passwordAAD(r.id, col.name))
+			if err != nil {
+				res.Failed = append(res.Failed, r.email+" ("+col.name+")")
+				continue
+			}
+			sealed, err := s.encrypt(r.id, col.name, plain)
+			if err != nil {
+				return res, err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE mailboxes SET `+col.name+`_enc = $2 WHERE id = $1`, r.id, sealed); err != nil {
+				return res, err
+			}
+			res.Resealed++
+		}
+	}
+	return res, tx.Commit(ctx)
 }
 
 // ----------------------------------------------------------------------------
@@ -310,7 +375,7 @@ func (s *Service) UpdateMailbox(ctx context.Context, id uuid.UUID, in MailboxInp
 		add("imap_username", trim(in.IMAPUsername))
 	}
 	if in.IMAPPassword != nil {
-		enc, err := s.encrypt(*in.IMAPPassword)
+		enc, err := s.encrypt(id, "imap_password", *in.IMAPPassword)
 		if err != nil {
 			return Mailbox{}, err
 		}
@@ -329,7 +394,7 @@ func (s *Service) UpdateMailbox(ctx context.Context, id uuid.UUID, in MailboxInp
 		add("smtp_username", trim(in.SMTPUsername))
 	}
 	if in.SMTPPassword != nil {
-		enc, err := s.encrypt(*in.SMTPPassword)
+		enc, err := s.encrypt(id, "smtp_password", *in.SMTPPassword)
 		if err != nil {
 			return Mailbox{}, err
 		}

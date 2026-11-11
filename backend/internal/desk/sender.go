@@ -174,7 +174,7 @@ func (s *Service) sendReply(ctx context.Context, threadID uuid.UUID) error {
 // smtpFor returns the mailbox's SMTP settings, or the module-wide ones.
 func (s *Service) smtpFor(mb Mailbox) (SMTPSettings, error) {
 	if mb.SMTPHost != "" {
-		pw, err := s.decrypt(mb.smtpPasswordEnc)
+		pw, err := s.decrypt(mb.ID, "smtp_password", mb.smtpPasswordEnc)
 		if err != nil {
 			return SMTPSettings{}, err
 		}

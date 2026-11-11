@@ -39,6 +39,8 @@ jobs:
       # Self-hosted runners (ARC scale set). On GitHub-hosted runners use:
       # runner: ubuntu-24.04, buildkit-endpoint: "", test-database-mode: service
       runner: arc-conservices
+      # Database tests (authorization, import, sender queue) read this URL.
+      test-database-env: DESK_TEST_DATABASE_URL
       images: >-
         [
           {"name": "backend", "dockerfile": "infra/Dockerfile.backend",

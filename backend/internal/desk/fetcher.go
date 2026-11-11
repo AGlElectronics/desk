@@ -84,7 +84,7 @@ func (s *Service) fetchOne(ctx context.Context, mb Mailbox, log zerolog.Logger) 
 
 // dialIMAP connects and logs in.
 func (s *Service) dialIMAP(mb Mailbox) (*imapclient.Client, error) {
-	password, err := s.decrypt(mb.imapPasswordEnc)
+	password, err := s.decrypt(mb.ID, "imap_password", mb.imapPasswordEnc)
 	if err != nil {
 		return nil, err
 	}

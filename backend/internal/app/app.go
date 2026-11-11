@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 
 	"github.com/AGlElectronics/desk/backend/internal/auth"
@@ -23,6 +24,7 @@ import (
 	"github.com/AGlElectronics/desk/backend/internal/denlink"
 	"github.com/AGlElectronics/desk/backend/internal/desk"
 	httpx "github.com/AGlElectronics/desk/backend/internal/http"
+	"github.com/AGlElectronics/desk/backend/internal/secretbox"
 	"github.com/AGlElectronics/desk/backend/internal/tlscert"
 )
 
@@ -90,10 +92,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	}
 	go den.Run(ctx)
 
-	deskSvc := desk.NewService(pool, cfg.SecretKey, desk.SMTPSettings{
-		Host: cfg.SMTPHost, Port: cfg.SMTPPort, Security: cfg.SMTPSecurity,
-		Username: cfg.SMTPUsername, Password: cfg.SMTPPassword,
-	})
+	deskSvc, err := newDeskService(pool, cfg)
+	if err != nil {
+		return err
+	}
+	logger.Info().Str("key_id", deskSvc.KeyID()).Int("previous_keys", len(cfg.PreviousSecretKeys)).Msg("secret key loaded")
 	// One replica: the fetcher assumes nobody else polls the same mailboxes.
 	// The workers stop before the pool closes (see runServer).
 	workCtx, stopWork := context.WithCancel(context.WithoutCancel(ctx))
@@ -128,6 +131,50 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	}
 
 	return runServer(ctx, server, stopWorkers, cfg.ShutdownTimeout, logger)
+}
+
+func newDeskService(pool *pgxpool.Pool, cfg *config.Config) (*desk.Service, error) {
+	keys, err := secretbox.New(cfg.SecretKey, cfg.PreviousSecretKeys...)
+	if err != nil {
+		return nil, fmt.Errorf("secret key: %w", err)
+	}
+	return desk.NewService(pool, desk.Options{
+		Keyring: keys,
+		SMTP: desk.SMTPSettings{
+			Host: cfg.SMTPHost, Port: cfg.SMTPPort, Security: cfg.SMTPSecurity,
+			Username: cfg.SMTPUsername, Password: cfg.SMTPPassword,
+		},
+		Development: cfg.IsDevelopment(),
+	}), nil
+}
+
+// Reencrypt seals every stored mailbox password under the current
+// DESK_SECRET_KEY (`server reencrypt`). It fails when a value cannot be
+// opened with DESK_SECRET_KEY or DESK_SECRET_KEY_PREVIOUS.
+func Reencrypt(ctx context.Context, logger zerolog.Logger) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	defer pool.Close()
+	svc, err := newDeskService(pool, cfg)
+	if err != nil {
+		return err
+	}
+	res, err := svc.Reencrypt(ctx)
+	if err != nil {
+		return fmt.Errorf("reencrypt: %w", err)
+	}
+	logger.Info().Str("key_id", svc.KeyID()).Int("resealed", res.Resealed).Int("already_current", res.Current).
+		Strs("failed", res.Failed).Msg("reencrypt finished")
+	if len(res.Failed) > 0 {
+		return fmt.Errorf("%d stored passwords could not be decrypted; enter them again in Desk", len(res.Failed))
+	}
+	return nil
 }
 
 // runServer serves until ctx is cancelled (SIGINT/SIGTERM in cmd/server),

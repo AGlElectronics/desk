@@ -103,11 +103,7 @@ func NewRouter(deps Deps, version string) http.Handler {
 		den = denlink.New(deps.Pool, denlink.Config{Slug: "desk", Version: version, Mode: deps.Config.DenMode}, deps.Logger)
 	}
 	brandH := &brandHandler{provider: deps.Brand, den: den}
-	svc := deps.Desk
-	if svc == nil {
-		svc = desk.NewService(deps.Pool, deps.Config.SecretKey, desk.SMTPSettings{})
-	}
-	dh := &deskHandler{svc: svc}
+	dh := &deskHandler{svc: deps.Desk}
 
 	r.Get("/livez", health.livez)
 	r.Get("/readyz", health.readyz)
