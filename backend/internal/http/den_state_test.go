@@ -18,8 +18,8 @@ import (
 // through authentication, and other API routes answer 503. No database is
 // needed: OIDC without a verifier refuses every request before a handler runs.
 func TestDenPairingGate(t *testing.T) {
-	cfg := &config.Config{AuthMode: config.AuthModeOIDC, DenMode: denlink.ModeRequired}
-	den := denlink.New(nil, denlink.Config{Slug: "test", Mode: cfg.DenMode}, zerolog.Nop())
+	cfg := &config.Config{AuthMode: config.AuthModeOIDC, Den: denlink.Config{Mode: denlink.ModeRequired}}
+	den := denlink.New(nil, cfg.Den, zerolog.Nop())
 	router := NewRouter(Deps{Config: cfg, Logger: zerolog.Nop(), Den: den}, "test")
 	get := func(path string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
@@ -29,7 +29,7 @@ func TestDenPairingGate(t *testing.T) {
 
 	for _, path := range []string{"/api/den/state", "/api/v1/den/state"} {
 		rec := get(path)
-		if got := strings.TrimSpace(rec.Body.String()); rec.Code != http.StatusOK || got != `{"mode":"required","paired":false}` {
+		if got := strings.TrimSpace(rec.Body.String()); rec.Code != http.StatusOK || got != `{"mode":"required","paired":false,"revoked":false}` {
 			t.Errorf("GET %s = %d %s", path, rec.Code, got)
 		}
 	}

@@ -3,12 +3,12 @@ package http
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/AGlElectronics/desk/backend/internal/authbase"
 	"github.com/AGlElectronics/desk/backend/internal/httperror"
 )
 
@@ -24,19 +24,32 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// decodeJSON strict-decodes the request body into dst and returns a
-// typed BadRequest on malformed input so handlers can hand the error
-// straight to httperror.Render.
+// maxJSONBody is authbase's default (1 MiB). Mail and saved-reply bodies,
+// which can carry pasted images, use maxMailJSON instead.
+const (
+	maxJSONBody = authbase.DefaultMaxBodyBytes
+	maxMailJSON = 20 << 20
+)
+
+// decodeJSON strict-decodes the request body into dst with the shared
+// decoder (1 MiB, unknown fields refused) and returns a typed error
+// handlers can hand to httperror.Render: 400 or 413.
 func decodeJSON(r *http.Request, dst any) error {
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
-		if errors.Is(err, io.EOF) {
-			return httperror.BadRequest("request body is empty")
-		}
-		return httperror.BadRequest("invalid JSON: " + err.Error())
+	return decodeJSONLimit(r, dst, maxJSONBody)
+}
+
+// decodeMailJSON is decodeJSON with the larger cap used for messages.
+func decodeMailJSON(r *http.Request, dst any) error {
+	return decodeJSONLimit(r, dst, maxMailJSON)
+}
+
+func decodeJSONLimit(r *http.Request, dst any, max int64) error {
+	err := authbase.DecodeJSON(nil, r, dst, authbase.DecodeOptions{MaxBytes: max, DisallowUnknownFields: true})
+	var de *authbase.DecodeError
+	if errors.As(err, &de) {
+		return httperror.New(httperror.Code(de.Code), de.Message).WithCause(err)
 	}
-	return nil
+	return err
 }
 
 // parseUUIDParam reads a chi URL parameter and parses it as a UUID. The

@@ -16,6 +16,10 @@
 // module is standalone and uses its own settings and default look. When Den
 // rejects the credential the link is marked revoked and stays so until an
 // admin pairs again; it is never re-paired automatically.
+//
+// ModuleSettingSecret fetches values Den keeps out of the bundle (the
+// SMTP password). RequireDen checks a call Den makes into the module,
+// such as GET /api/portal/todos.
 package denlink
 
 import (
@@ -263,6 +267,14 @@ type Client struct {
 	// linked mirrors whether the den_link row exists, revoked whether its
 	// revoked_at is set.
 	linked, revoked bool
+
+	// secretsMu guards the in-memory copy of Den's secrets document.
+	// It is not mu: fetching the document does HTTP, and markRevoked
+	// (called from that HTTP) clears the copy.
+	secretsMu   sync.Mutex
+	secretRaw   []byte
+	secretAt    time.Time
+	secretEpoch uint64
 }
 
 // New returns a Client; call Run to start syncing. An invalid cfg (see
@@ -303,9 +315,45 @@ func Open(pool *pgxpool.Pool, cfg Config, log zerolog.Logger) (*Client, error) {
 // ErrNotPaired is returned when an operation needs a pairing.
 var ErrNotPaired = errors.New("not connected to Den")
 
+// messageError keeps a Go error string (Error) apart from the sentence
+// shown to people (text): the API "message" field and den_link.last_error.
+// Go error strings start with a lowercase letter and have no trailing
+// punctuation; the Den connection page keeps the sentence.
+type messageError struct {
+	err  error
+	text string
+}
+
+func (e *messageError) Error() string { return e.err.Error() }
+
+func (e *messageError) Unwrap() error { return e.err }
+
+func withUI(err error, text string) error { return &messageError{err: err, text: text} }
+
+// UserMessage is the sentence for people. Errors without one (and a nil
+// error) return Error(), or "" when err is nil. Handlers and last_error
+// use it, so a module that shows those still shows the original wording.
+func UserMessage(err error) string {
+	var m *messageError
+	if errors.As(err, &m) && m.text != "" {
+		return m.text
+	}
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// revokedMessage is what an admin sees when Den rejects the credential.
+const revokedMessage = "Den rejected this module's credential (revoked, or the module was removed in Den); pair again from Den → Modules → Pair"
+
 // ErrRevoked is returned when Den rejects the module's credential. The link
-// is marked revoked; an admin has to pair again.
-var ErrRevoked = errors.New("Den rejected this module's credential (revoked, or the module was removed in Den); pair again from Den → Modules → Pair")
+// is marked revoked; an admin has to pair again. Error() is the Go string;
+// UserMessage is revokedMessage, which the Den connection page shows.
+var ErrRevoked error = withUI(
+	errors.New("den rejected this module's credential (revoked, or the module was removed in Den); pair again from Den → Modules → Pair"),
+	revokedMessage,
+)
 
 type link struct {
 	baseURL, credential, moduleID string
@@ -573,7 +621,8 @@ func (c *Client) Pair(ctx context.Context, pairingURL string) (Status, error) {
 	}
 	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode != http.StatusOK {
-		return Status{}, fmt.Errorf("Den refused the pairing URL: %s", denError(res))
+		detail := denError(res)
+		return Status{}, withUI(fmt.Errorf("den refused the pairing URL: %s", detail), "Den refused the pairing URL: "+detail)
 	}
 	var out struct {
 		Credential string `json:"credential"`
@@ -599,6 +648,7 @@ func (c *Client) Pair(ctx context.Context, pairingURL string) (Status, error) {
 		return Status{}, err
 	}
 	c.setLinked(true, false)
+	c.clearSecretCache()
 	if err := c.Sync(ctx); err != nil {
 		c.log.Warn().Err(err).Msg("den link: first sync failed")
 	}
@@ -613,6 +663,7 @@ func (c *Client) Unpair(ctx context.Context) error {
 	c.mu.Lock()
 	c.bundle, c.assets, c.linked, c.revoked = nil, map[string]asset{}, false, false
 	c.mu.Unlock()
+	c.clearSecretCache()
 	return nil
 }
 
@@ -633,7 +684,7 @@ func (c *Client) Sync(ctx context.Context) error {
 		}
 	}
 	if err != nil {
-		_, _ = c.pool.Exec(ctx, `UPDATE den_link SET last_error = $1 WHERE id = 1`, err.Error())
+		_, _ = c.pool.Exec(ctx, `UPDATE den_link SET last_error = $1 WHERE id = 1`, UserMessage(err))
 		return err
 	}
 	if _, err := c.pool.Exec(ctx, `UPDATE den_link SET bundle = $1, synced_at = now(), last_error = '', revoked_at = NULL WHERE id = 1`, raw); err != nil {
@@ -642,12 +693,16 @@ func (c *Client) Sync(ctx context.Context) error {
 	c.mu.Lock()
 	c.bundle, c.revoked = b, false
 	c.mu.Unlock()
+	// The bundle has no password. Drop the cached one so the next send
+	// asks Den again (a password changed in Den, or Sync now).
+	c.clearSecretCache()
 	return nil
 }
 
 // markRevoked records that Den rejected the credential. It never re-pairs.
 func (c *Client) markRevoked(ctx context.Context) {
-	if _, err := c.pool.Exec(ctx, `UPDATE den_link SET revoked_at = COALESCE(revoked_at, now()), last_error = $1 WHERE id = 1`, ErrRevoked.Error()); err != nil {
+	c.clearSecretCache()
+	if _, err := c.pool.Exec(ctx, `UPDATE den_link SET revoked_at = COALESCE(revoked_at, now()), last_error = $1 WHERE id = 1`, UserMessage(ErrRevoked)); err != nil {
 		c.log.Warn().Err(err).Msg("den link: could not record the revoked credential")
 	}
 	c.mu.Lock()
@@ -690,7 +745,8 @@ func (c *Client) send(ctx context.Context, l *link, method, path string, body an
 	}
 	if res.StatusCode != http.StatusOK {
 		defer func() { _ = res.Body.Close() }()
-		return nil, fmt.Errorf("Den returned %s", denError(res))
+		detail := denError(res)
+		return nil, withUI(fmt.Errorf("den returned %s", detail), "Den returned "+detail)
 	}
 	return res, nil
 }
@@ -1008,7 +1064,7 @@ func (c *Client) PairHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	s, err := c.Pair(r.Context(), in.PairingURL)
 	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "pairing_failed", err.Error())
+		writeError(w, http.StatusUnprocessableEntity, "pairing_failed", UserMessage(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, s)
@@ -1021,10 +1077,10 @@ func (c *Client) SyncHandler(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, ErrNotPaired):
 			code = http.StatusConflict
 		case errors.Is(err, ErrRevoked):
-			writeError(w, http.StatusConflict, "den_credential_revoked", err.Error())
+			writeError(w, http.StatusConflict, "den_credential_revoked", UserMessage(err))
 			return
 		}
-		writeError(w, code, "sync_failed", err.Error())
+		writeError(w, code, "sync_failed", UserMessage(err))
 		return
 	}
 	c.StatusHandler(w, r)

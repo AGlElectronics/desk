@@ -15,6 +15,7 @@ import (
 	"github.com/AGlElectronics/desk/backend/internal/auth"
 	"github.com/AGlElectronics/desk/backend/internal/desk"
 	"github.com/AGlElectronics/desk/backend/internal/domain"
+	"github.com/AGlElectronics/desk/backend/internal/groupmatch"
 	"github.com/AGlElectronics/desk/backend/internal/httperror"
 )
 
@@ -40,14 +41,14 @@ func person(u *auth.User) *desk.Person {
 }
 
 // accessOf derives the caller's Desk access from their token.
-func accessOf(u *auth.User) desk.Access {
+func accessOf(u *auth.User, gm groupmatch.Config) desk.Access {
 	var orgs []uuid.UUID
 	for org, perms := range u.OrgPermissions {
 		if _, ok := perms[domain.PermMailboxManage]; ok {
 			orgs = append(orgs, org)
 		}
 	}
-	return desk.NewAccess(u.ID, u.Groups, orgs)
+	return desk.NewAccess(u.ID, u.Groups, orgs, gm)
 }
 
 func (h *deskHandler) who(r *http.Request) (desk.Access, *desk.Person, error) {
@@ -55,7 +56,7 @@ func (h *deskHandler) who(r *http.Request) (desk.Access, *desk.Person, error) {
 	if err != nil {
 		return desk.Access{}, nil, err
 	}
-	return accessOf(u), person(u), nil
+	return accessOf(u, h.svc.GroupMatch()), person(u), nil
 }
 
 // handle wraps a handler that returns (status, body, error).
@@ -116,7 +117,7 @@ func (h *deskHandler) createMailbox(r *http.Request) (int, any, error) {
 		desk.MailboxInput
 		OrganizationID *uuid.UUID `json:"organization_id"`
 	}
-	if err := decodeJSON(r, &in); err != nil {
+	if err := decodeMailJSON(r, &in); err != nil {
 		return 0, nil, err
 	}
 	org, err := pickOrganization(a, in.OrganizationID)
@@ -178,7 +179,7 @@ func (h *deskHandler) updateMailbox(r *http.Request) (int, any, error) {
 		return 0, nil, err
 	}
 	var in desk.MailboxInput
-	if err := decodeJSON(r, &in); err != nil {
+	if err := decodeMailJSON(r, &in); err != nil {
 		return 0, nil, err
 	}
 	if err := desk.RequireWork(a, mb); err != nil {
@@ -361,7 +362,7 @@ func (h *deskHandler) createConversation(r *http.Request) (int, any, error) {
 		BodyHTML      string    `json:"body_html"`
 		CC            []string  `json:"cc"`
 	}
-	if err := decodeJSON(r, &in); err != nil {
+	if err := decodeMailJSON(r, &in); err != nil {
 		return 0, nil, err
 	}
 	mb, err := h.svc.MailboxFor(r.Context(), a, in.MailboxID)
@@ -487,7 +488,7 @@ func (h *deskHandler) addThread(r *http.Request) (int, any, error) {
 		CC       *[]string `json:"cc"`
 		Status   *string   `json:"status"`
 	}
-	if err := decodeJSON(r, &in); err != nil {
+	if err := decodeMailJSON(r, &in); err != nil {
 		return 0, nil, err
 	}
 	if err := desk.RequireWork(cc.a, cc.mb); err != nil {
@@ -510,7 +511,7 @@ func (h *deskHandler) forward(r *http.Request) (int, any, error) {
 		Body     string     `json:"body"`
 		BodyHTML string     `json:"body_html"`
 	}
-	if err := decodeJSON(r, &in); err != nil {
+	if err := decodeMailJSON(r, &in); err != nil {
 		return 0, nil, err
 	}
 	if err := desk.RequireWork(cc.a, cc.mb); err != nil {
@@ -879,7 +880,7 @@ func (h *deskHandler) createSavedReply(r *http.Request) (int, any, error) {
 		return 0, nil, err
 	}
 	var in desk.SavedReplyInput
-	if err := decodeJSON(r, &in); err != nil {
+	if err := decodeMailJSON(r, &in); err != nil {
 		return 0, nil, err
 	}
 	if err := h.savedReplyRights(r, a, in.MailboxID); err != nil {
@@ -911,7 +912,7 @@ func (h *deskHandler) updateSavedReply(r *http.Request) (int, any, error) {
 		return 0, nil, err
 	}
 	var in desk.SavedReplyInput
-	if err := decodeJSON(r, &in); err != nil {
+	if err := decodeMailJSON(r, &in); err != nil {
 		return 0, nil, err
 	}
 	out, err := h.svc.UpdateSavedReply(r.Context(), sr.ID, in)

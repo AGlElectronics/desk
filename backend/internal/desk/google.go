@@ -160,7 +160,7 @@ type GoogleInfo struct {
 
 // Integrations reports the configured connectors.
 func (s *Service) Integrations(ctx context.Context) Integrations {
-	out := Integrations{Notifications: s.NotificationsEnabled(), NotifyFrom: s.notifyFrom, ModuleSMTP: s.smtp.Host != ""}
+	out := Integrations{Notifications: s.NotificationsEnabled(), NotifyFrom: s.notifySender(), ModuleSMTP: s.moduleSMTPHost() != ""}
 	if s.google != nil {
 		out.Google = &GoogleInfo{Domain: s.google.Domain, SharedMailbox: s.google.SharedMailbox, Label: s.google.Label, Shared: s.sharedStatus(ctx)}
 	}

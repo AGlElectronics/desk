@@ -9,11 +9,15 @@ type DenStatus = {
   paired_at?: string;
   synced_at?: string;
   last_error?: string;
+  /** Den rejected the stored credential (revoked, or the module was removed in Den). */
+  revoked?: boolean;
+  revoked_at?: string;
 };
 
 /**
  * Pairing with Den. Paired: brand and organisation settings come from Den.
- * Standalone: this module's own settings apply.
+ * Standalone: this module's own settings apply. Revoked: Den rejected the
+ * credential; Desk keeps the last settings until an admin pairs again.
  */
 export function DenConnection({ base, onPaired }: { base: string; onPaired?: () => void }) {
   const qc = useQueryClient();
@@ -35,7 +39,27 @@ export function DenConnection({ base, onPaired }: { base: string; onPaired?: () 
   const sync = useMutation({ mutationFn: () => apiRequest<DenStatus>(`${base}/sync`, { method: 'POST' }), onSettled: refresh });
   const unpair = useMutation({ mutationFn: () => apiRequest<void>(`${base}/pair`, { method: 'DELETE' }), onSuccess: refresh });
   const s = status.data;
+  const revoked = Boolean(s?.revoked);
   const error = (pair.error ?? sync.error ?? unpair.error) as Error | null;
+
+  const pairForm = (hint: string, button: string) => (
+    <form className="space-y-2"
+      onSubmit={(e) => {
+        e.preventDefault();
+        pair.mutate();
+      }}>
+      <p className="text-muted-foreground">{hint}</p>
+      <div className="flex gap-2">
+        <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://den.example/api/v1/integrations/pairing/redeem?token=…"
+          aria-label="Pairing URL"
+          className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-xs" />
+        <button type="submit" disabled={!url.trim() || pair.isPending}
+          className="rounded-pill bg-primary px-4 py-2 font-semibold text-primary-foreground disabled:opacity-60">
+          {pair.isPending ? 'Connecting…' : button}
+        </button>
+      </div>
+    </form>
+  );
 
   return (
     <section className="space-y-3 rounded-lg border border-border bg-card p-4 text-sm">
@@ -47,6 +71,18 @@ export function DenConnection({ base, onPaired }: { base: string; onPaired?: () 
       </div>
       {status.isPending ? (
         <p className="text-muted-foreground">Checking…</p>
+      ) : revoked && s ? (
+        <>
+          <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-destructive">
+            <p className="font-semibold">Den rejected this module&apos;s credential.</p>
+            <p>
+              The module was removed in Den or its credential was revoked
+              {s.revoked_at && <> on {new Date(s.revoked_at).toLocaleString()}</>}. Desk keeps the last settings from
+              Den but no longer receives changes. Pair again manually.
+            </p>
+          </div>
+          {pairForm('New pairing URL from Den:', 'Pair again')}
+        </>
       ) : s?.paired ? (
         <>
           <p>
@@ -69,23 +105,10 @@ export function DenConnection({ base, onPaired }: { base: string; onPaired?: () 
           </div>
         </>
       ) : (
-        <form className="space-y-2"
-          onSubmit={(e) => {
-            e.preventDefault();
-            pair.mutate();
-          }}>
-          <p className="text-muted-foreground">
-            Standalone. To connect, open Den → Admin → Modules, create a pairing URL for this module and paste it here.
-          </p>
-          <div className="flex gap-2">
-            <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://den.example/api/v1/integrations/pairing/redeem?token=…"
-              className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-xs" />
-            <button type="submit" disabled={!url.trim() || pair.isPending}
-              className="rounded-pill bg-primary px-4 py-2 font-semibold text-primary-foreground disabled:opacity-60">
-              {pair.isPending ? 'Connecting…' : 'Connect'}
-            </button>
-          </div>
-        </form>
+        pairForm(
+          'Standalone. To connect, open Den → Admin → Modules, create a pairing URL for this module and paste it here.',
+          'Connect',
+        )
       )}
       {error && <p className="text-destructive">{error.message}</p>}
     </section>

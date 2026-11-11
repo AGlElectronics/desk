@@ -18,7 +18,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AGlElectronics/desk/backend/internal/blob"
+	"github.com/AGlElectronics/desk/backend/internal/denlink"
 	"github.com/AGlElectronics/desk/backend/internal/domain"
+	"github.com/AGlElectronics/desk/backend/internal/groupmatch"
 	"github.com/AGlElectronics/desk/backend/internal/httperror"
 	"github.com/AGlElectronics/desk/backend/internal/netguard"
 	"github.com/AGlElectronics/desk/backend/internal/secretbox"
@@ -34,6 +36,8 @@ type SMTPSettings struct {
 	Password string
 
 	moduleWide bool
+	// fromDen: the module-wide server comes from Den's module settings.
+	fromDen bool
 }
 
 // Options configures a Service.
@@ -55,6 +59,20 @@ type Options struct {
 	NotifyFrom string
 	// BaseURL is the web app address used in links in Desk's emails.
 	BaseURL string
+	// GroupMatch compares people's groups with mailbox role groups
+	// (OIDC_GROUP_MATCH, OIDC_GROUP_PREFIX).
+	GroupMatch groupmatch.Config
+	// Den supplies Den's module settings (SMTP, retention); nil when
+	// standalone.
+	Den ModuleSettingsSource
+	// DenSMTPPassword fetches the SMTP password Den holds (only asked when
+	// Den's smtp.password_set is true).
+	DenSMTPPassword func(ctx context.Context) (string, error)
+}
+
+// ModuleSettingsSource is the part of the Den link Desk reads settings from.
+type ModuleSettingsSource interface {
+	ModuleSettings() *denlink.ModuleSettings
 }
 
 // Service is safe for concurrent use.
@@ -66,9 +84,12 @@ type Service struct {
 	guard *netguard.Guard
 	blobs blob.Store
 	// google is nil when Google Workspace is not configured.
-	google     *GoogleOptions
-	notifyFrom string
-	baseURL    string
+	google          *GoogleOptions
+	notifyFrom      string
+	baseURL         string
+	groups          groupmatch.Config
+	den             ModuleSettingsSource
+	denSMTPPassword func(ctx context.Context) (string, error)
 	// fetchInterval is the polling interval back-off starts from.
 	fetchInterval time.Duration
 	// fetchNow wakes the fetcher early ("Fetch now" in the UI).
@@ -88,14 +109,33 @@ func NewService(pool *pgxpool.Pool, opts Options) *Service {
 	}
 	return &Service{
 		pool: pool, keys: opts.Keyring, smtp: opts.SMTP, dev: opts.Development,
-		guard:         netguard.New(opts.AllowedMailHosts),
-		blobs:         opts.Blobs,
-		google:        opts.Google,
-		notifyFrom:    opts.NotifyFrom,
-		baseURL:       strings.TrimRight(opts.BaseURL, "/"),
-		fetchInterval: time.Minute,
-		fetchNow:      make(chan uuid.UUID, 16),
+		guard:           netguard.New(opts.AllowedMailHosts),
+		blobs:           opts.Blobs,
+		google:          opts.Google,
+		notifyFrom:      opts.NotifyFrom,
+		baseURL:         strings.TrimRight(opts.BaseURL, "/"),
+		groups:          opts.GroupMatch,
+		den:             opts.Den,
+		denSMTPPassword: opts.DenSMTPPassword,
+		fetchInterval:   time.Minute,
+		fetchNow:        make(chan uuid.UUID, 16),
 	}
+}
+
+// GroupMatch is the OIDC group rule this service was built with.
+func (s *Service) GroupMatch() groupmatch.Config {
+	if s == nil {
+		return groupmatch.Config{}
+	}
+	return s.groups
+}
+
+// moduleSettings is Den's module settings for Desk, nil when standalone.
+func (s *Service) moduleSettings() *denlink.ModuleSettings {
+	if s.den == nil {
+		return nil
+	}
+	return s.den.ModuleSettings()
 }
 
 // KeyID names the current DESK_SECRET_KEY (safe to log).
@@ -401,19 +441,19 @@ type MailboxInput struct {
 	Slug         *string    `json:"slug"`
 	AutoReply    *AutoReply `json:"auto_reply"`
 	Name         *string    `json:"name"`
-	Email        *string `json:"email"`
-	Signature    *string `json:"signature"`
-	IMAPHost     *string `json:"imap_host"`
-	IMAPPort     *int    `json:"imap_port"`
-	IMAPSecurity *string `json:"imap_security"`
-	IMAPUsername *string `json:"imap_username"`
-	IMAPPassword *string `json:"imap_password"`
-	IMAPMoveTo   *string `json:"imap_move_to"`
-	SMTPHost     *string `json:"smtp_host"`
-	SMTPPort     *int    `json:"smtp_port"`
-	SMTPSecurity *string `json:"smtp_security"`
-	SMTPUsername *string `json:"smtp_username"`
-	SMTPPassword *string `json:"smtp_password"`
+	Email        *string    `json:"email"`
+	Signature    *string    `json:"signature"`
+	IMAPHost     *string    `json:"imap_host"`
+	IMAPPort     *int       `json:"imap_port"`
+	IMAPSecurity *string    `json:"imap_security"`
+	IMAPUsername *string    `json:"imap_username"`
+	IMAPPassword *string    `json:"imap_password"`
+	IMAPMoveTo   *string    `json:"imap_move_to"`
+	SMTPHost     *string    `json:"smtp_host"`
+	SMTPPort     *int       `json:"smtp_port"`
+	SMTPSecurity *string    `json:"smtp_security"`
+	SMTPUsername *string    `json:"smtp_username"`
+	SMTPPassword *string    `json:"smtp_password"`
 }
 
 func (s *Service) checkSecurity(v *string) string {
@@ -725,25 +765,28 @@ const maxPeople = 100
 // ListPeople returns people who have signed in to Desk, matching q (name
 // or email) when set. With a mailbox, only those who may work it (its
 // managers, as of their last sign-in, and Desk admins).
+//
+// Groups are matched in Go (groupmatch), so the query reads every match
+// and stops at maxPeople.
 func (s *Service) ListPeople(ctx context.Context, mb *Mailbox, q string) ([]Person, error) {
-	var group string
-	if mb != nil {
-		group = domain.MailboxGroup(mb.Slug, domain.LevelManager)
-	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, display_name, COALESCE(email, '') FROM users
-		 WHERE ($1 = '' OR desk_admin OR $1 = ANY(groups))
-		   AND ($2 = '' OR display_name ILIKE '%' || $2 || '%' OR email ILIKE '%' || $2 || '%')
-		 ORDER BY display_name LIMIT $3`, group, strings.TrimSpace(q), maxPeople)
+		SELECT id, display_name, COALESCE(email, ''), desk_admin, groups FROM users
+		 WHERE ($1 = '' OR display_name ILIKE '%' || $1 || '%' OR email ILIKE '%' || $1 || '%')
+		 ORDER BY display_name`, strings.TrimSpace(q))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []Person{}
-	for rows.Next() {
+	for rows.Next() && len(out) < maxPeople {
 		var p Person
-		if err := rows.Scan(&p.ID, &p.DisplayName, &p.Email); err != nil {
+		var admin bool
+		var groups []string
+		if err := rows.Scan(&p.ID, &p.DisplayName, &p.Email, &admin, &groups); err != nil {
 			return nil, err
+		}
+		if mb != nil && !admin && !HasMailboxRole(s.groups, groups, mb.Slug, domain.LevelManager) {
+			continue
 		}
 		out = append(out, p)
 	}

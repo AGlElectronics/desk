@@ -14,6 +14,8 @@ import (
 	"sort"
 
 	"github.com/google/uuid"
+
+	"github.com/AGlElectronics/desk/backend/internal/authbase"
 )
 
 // Membership records that a user holds one role organization-wide. A user
@@ -32,8 +34,8 @@ type User struct {
 	Email       string
 	DisplayName string
 	Memberships []Membership
-	// Groups are the token's IdP groups, normalized (lower case, no
-	// leading "/"). Per-mailbox roles are read from them.
+	// Groups are the token's IdP groups (OIDC_GROUPS_CLAIM) in groupmatch's
+	// stored form. Per-mailbox roles are matched against them.
 	Groups []string
 
 	// Permissions holds the union of every role's permissions across every
@@ -43,6 +45,14 @@ type User struct {
 	// OrgPermissions holds the permissions the user has when operating on
 	// resources owned by a specific organization.
 	OrgPermissions map[uuid.UUID]map[string]struct{}
+}
+
+// Key is the person's identity across Con Services: (issuer, subject).
+func (u *User) Key() authbase.UserKey {
+	if u == nil {
+		return authbase.UserKey{}
+	}
+	return authbase.UserKey{Issuer: u.Issuer, Subject: u.Subject}
 }
 
 // HasAny returns true if the user holds `perm` anywhere (any org). Use for

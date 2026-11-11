@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/AGlElectronics/desk/backend/internal/domain"
+	"github.com/AGlElectronics/desk/backend/internal/groupmatch"
 	"github.com/AGlElectronics/desk/backend/internal/httperror"
 )
 
@@ -14,23 +15,41 @@ import (
 // Desk admins (mailbox.manage in a mailbox's organization) may do
 // everything there; everyone else needs the mailbox's roles, granted by the
 // groups desk-<slug>-viewer, -manager and -delete.
+//
+// Groups are compared with the shared rule (groupmatch), so
+// OIDC_GROUP_PREFIX and OIDC_GROUP_MATCH=last apply to mailbox roles too.
 type Access struct {
 	UserID    uuid.UUID
 	adminOrgs map[uuid.UUID]bool
-	groups    map[string]bool
+	gm        groupmatch.Config
+	// keys holds each group's comparison form (groupmatch Config.Key).
+	keys map[string]bool
 }
 
-// NewAccess builds a caller's access from their normalized groups and the
-// organizations where they hold mailbox.manage.
-func NewAccess(userID uuid.UUID, groups []string, adminOrgs []uuid.UUID) Access {
-	a := Access{UserID: userID, adminOrgs: map[uuid.UUID]bool{}, groups: map[string]bool{}}
+// NewAccess builds a caller's access from their groups, the organizations
+// where they hold mailbox.manage and the group matching settings.
+func NewAccess(userID uuid.UUID, groups []string, adminOrgs []uuid.UUID, gm ...groupmatch.Config) Access {
+	var g groupmatch.Config
+	if len(gm) > 0 {
+		g = gm[0]
+	}
+	a := Access{UserID: userID, adminOrgs: map[uuid.UUID]bool{}, gm: g, keys: map[string]bool{}}
 	for _, o := range adminOrgs {
 		a.adminOrgs[o] = true
 	}
-	for _, g := range groups {
-		a.groups[strings.ToLower(strings.TrimPrefix(g, "/"))] = true
+	for _, name := range groups {
+		if k := a.gm.Key(name); k != "" {
+			a.keys[k] = true
+		}
 	}
 	return a
+}
+
+// HasMailboxRole reports whether groups grant level l of the mailbox slug.
+// Used where no request token exists (notifications, assignee picker) with
+// the groups stored at the person's last sign-in.
+func HasMailboxRole(gm groupmatch.Config, groups []string, slug string, l domain.MailboxLevel) bool {
+	return gm.Match(groups, domain.MailboxGroup(slug, l))
 }
 
 // IsAdmin: Desk admin in org.
@@ -49,7 +68,8 @@ func (a Access) AdminOrgs() []uuid.UUID {
 }
 
 func (a Access) has(slug string, l domain.MailboxLevel) bool {
-	return a.groups[domain.MailboxGroup(slug, l)]
+	k := a.gm.Key(domain.MailboxGroup(slug, l))
+	return k != "" && a.keys[k]
 }
 
 // CanView: read the mailbox's conversations (any of its roles).
@@ -82,10 +102,12 @@ func (a Access) Rights(mb Mailbox) MailboxRights {
 	return MailboxRights{View: a.CanView(mb), Work: a.CanWork(mb), Delete: a.CanDelete(mb), Admin: a.IsAdmin(mb.OrganizationID)}
 }
 
-// slugs the caller holds any role for.
+// slugs the caller may hold a role for (candidates; CanView decides). The
+// comparison form of a mailbox group is desk-<slug>-<level> in every
+// supported setting, because mailbox groups have no path and no prefix.
 func (a Access) slugs() []string {
 	set := map[string]bool{}
-	for g := range a.groups {
+	for g := range a.keys {
 		if !strings.HasPrefix(g, "desk-") {
 			continue
 		}

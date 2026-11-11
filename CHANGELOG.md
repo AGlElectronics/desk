@@ -15,6 +15,16 @@ counts rebuilds of the same version. Rebuilds get no entry here.
 
 ### Added
 
+- **BREAKING:** `AUTH_MODE` defaults to `oidc` and `APP_ENV` defaults to `production`. Set `APP_ENV=development` explicitly for local Compose and tests. `AUTH_MODE=dev` is refused outside development, and the `X-Dev-User` / `X-Dev-Groups` headers are removed and left out of CORS in every other mode.
+- **BREAKING:** the API accepts only an access token whose audience is `desk-api` (`OIDC_AUDIENCE`, that default). An ID token is refused. The web app keeps the access token in memory and signs in silently after a reload; it no longer sends the ID token. Point Keycloak's audience mapper at `desk-api` (the dev realm already does) and set `OIDC_AUDIENCE=desk-api`.
+- **BREAKING:** Google settings were renamed to the shared names. Use `GOOGLE_WORKSPACE_CREDENTIALS_FILE` and `GOOGLE_WORKSPACE_ADMIN_EMAIL`. The old names `GOOGLE_SERVICE_ACCOUNT_FILE` and `GOOGLE_ADMIN_USER` stop the backend from starting, with a message that names the new variable.
+- **BREAKING:** `GET /api/role-catalog` is no longer public. Call it with `HR_SERVICE_TOKEN` (at least 32 characters, the same value HR has) or with a staff access token. The catalog now sends `revision` (also the `ETag`; `If-None-Match` answers 304), `group_display`, `privileged` and `dynamic`. Delete roles and Desk admin are privileged; the three roles of each mailbox are dynamic.
+- Den portal to-dos: `GET /api/portal/todos`. Den's backend calls it with the pairing credential and `X-Den-User-Issuer` / `X-Den-User-Subject`. The answer is the open conversations assigned to that person. Not paired: 404. Wrong credential: 401. The chart admits `den-backend` from `conservices-den`.
+- Den link uses the shared client: `DEN_LINK_ENCRYPTION_KEY` (and `_PREVIOUS` while rotating) encrypts the stored credential, and `den_link.revoked_at` records a rejected credential. The Den connection card then says to pair again. SMTP and retention come from Den's module settings (`smtp.*`, `desk.retention.*`); when Den holds the SMTP password, Desk fetches it when sending and does not store it.
+- Per-mailbox roles are matched with `OIDC_GROUP_MATCH`, `OIDC_GROUP_PREFIX` and only the claim `OIDC_GROUPS_CLAIM`. Sign-in stores each group normalised and as the token sent it.
+- JSON bodies are limited to 1 MiB. New conversations, replies, forwards, mailbox signatures and saved replies may be up to 20 MiB. Oversized bodies answer `413 request_too_large`.
+- The web app's nginx sends the shared security headers only on the pages it serves, not on `/api/`. Inline scripts moved to `theme-init.js` and `silent-callback.js`. Customer mail stays in a sandboxed frame (`about:srcdoc` is allowed in the page policy).
+
 - Shared-inbox helpdesk: each support address is a mailbox, and every email
   thread becomes a conversation that staff assign, answer, annotate and
   close in the browser. Customers never sign in; to them it is plain email.
@@ -24,8 +34,8 @@ counts rebuilds of the same version. Rebuilds get no entry here.
   account and routed by recipient (`google_group`, replies sent "send as"
   the group address). Needs a service account with domain-wide delegation;
   see [Google Workspace setup](https://aglelectronics.github.io/con-services/modules/desk/google-workspace/).
-  New settings `GOOGLE_WORKSPACE_DOMAIN`, `GOOGLE_SERVICE_ACCOUNT_FILE`,
-  `GOOGLE_ADMIN_USER`, `GOOGLE_SHARED_MAILBOX` and `GOOGLE_LABEL`
+  New settings `GOOGLE_WORKSPACE_DOMAIN`, `GOOGLE_WORKSPACE_CREDENTIALS_FILE`,
+  `GOOGLE_WORKSPACE_ADMIN_EMAIL`, `GOOGLE_SHARED_MAILBOX` and `GOOGLE_LABEL`
   (default `Desk`). Mail Desk has handled gets the Gmail label `Desk`.
 - **IMAP/SMTP** connector for mail servers outside Google: IMAP polling and
   SMTP per mailbox (or the module-wide `SMTP_*` server), a connection test

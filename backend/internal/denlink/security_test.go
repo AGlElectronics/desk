@@ -430,7 +430,7 @@ func TestPairEncryptsRevokesAndPairsAgain(t *testing.T) {
 		t.Fatalf("Revoked=%v Linked=%v", c.Revoked(), c.Linked())
 	}
 	st, _ = c.Status(ctx)
-	if !st.Revoked || st.RevokedAt == nil || !strings.Contains(st.LastError, "pair again") {
+	if !st.Revoked || st.RevokedAt == nil || st.LastError != UserMessage(ErrRevoked) {
 		t.Fatalf("status after revoke: %+v", st)
 	}
 	rec := httptest.NewRecorder()
@@ -440,7 +440,7 @@ func TestPairEncryptsRevokesAndPairsAgain(t *testing.T) {
 	}
 	rec = httptest.NewRecorder()
 	c.SyncHandler(rec, httptest.NewRequest(http.MethodPost, "/api/den/sync", nil))
-	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "den_credential_revoked") {
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "den_credential_revoked") || !strings.Contains(rec.Body.String(), UserMessage(ErrRevoked)) {
 		t.Fatalf("SyncHandler: %d %s", rec.Code, rec.Body.String())
 	}
 	if c.Bundle() == nil {

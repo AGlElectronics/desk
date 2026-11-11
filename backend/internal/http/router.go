@@ -33,14 +33,13 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/cors"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 
 	"github.com/AGlElectronics/desk/backend/internal/auth"
+	"github.com/AGlElectronics/desk/backend/internal/authbase"
 	"github.com/AGlElectronics/desk/backend/internal/brand"
-	"github.com/AGlElectronics/desk/backend/internal/clientip"
 	"github.com/AGlElectronics/desk/backend/internal/config"
 	"github.com/AGlElectronics/desk/backend/internal/denlink"
 	"github.com/AGlElectronics/desk/backend/internal/desk"
@@ -64,9 +63,12 @@ type Deps struct {
 // Version is passed in from cmd/server at build time.
 func NewRouter(deps Deps, version string) http.Handler {
 	r := chi.NewRouter()
+	authCfg := deps.Config.Auth()
 
 	r.Use(chimiddleware.RequestID)
-	r.Use(clientip.Middleware(deps.Config.TrustedProxyCIDRs))
+	// RemoteAddr becomes the real client behind TRUSTED_PROXY_CIDRS, before
+	// the request log and every rate limiter.
+	r.Use(authCfg.TrustedProxies.Middleware)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Timeout(60 * time.Second))
 
@@ -82,22 +84,24 @@ func NewRouter(deps Deps, version string) http.Handler {
 	}))
 	r.Use(hlog.RequestIDHandler("request_id", "X-Request-ID"))
 
-	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   deps.Config.CORSAllowedOrigins,
-		AllowedMethods:   []string{"GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Dev-User", "X-Dev-Groups", "X-Request-ID"},
-		ExposedHeaders:   []string{"X-Request-ID", "Content-Disposition"},
-		AllowCredentials: true,
-		MaxAge:           300,
+	// Shared hardening (authbase). Dev identity headers are allowed through
+	// CORS, and left on the request, only when AUTH_MODE=dev in development.
+	// X-Request-ID and Content-Disposition are readable by the web app.
+	r.Use(authbase.SecurityHeaders)
+	r.Use(authCfg.StripDevHeaders)
+	r.Use(authCfg.CORS(authbase.CORSOptions{
+		AllowedOrigins: deps.Config.CORSAllowedOrigins,
+		AllowedMethods: []string{"GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"},
+		ExposeHeaders:  []string{"X-Request-ID", "Content-Disposition"},
 	}))
 
 	health := newHealthHandler(deps.Pool, version)
-	resolver := auth.NewResolver(deps.Pool, deps.Access)
+	resolver := auth.NewResolver(deps.Pool, deps.Access, deps.Config.GroupMatch)
 	authMW := auth.Middleware(deps.Config, resolver, deps.OIDCVerifier)
 
 	den := deps.Den
 	if den == nil {
-		den = denlink.New(deps.Pool, denlink.Config{Slug: "desk", Version: version, Mode: deps.Config.DenMode}, deps.Logger)
+		den = denlink.New(deps.Pool, deps.Config.DenConfig(version), deps.Logger)
 	}
 	brandH := &brandHandler{provider: deps.Brand, den: den}
 	dh := &deskHandler{svc: deps.Desk}
@@ -106,59 +110,66 @@ func NewRouter(deps Deps, version string) http.Handler {
 	r.Get("/readyz", health.readyz)
 
 	r.Route("/api", func(api chi.Router) {
-		api.Use(den.RequirePaired)
-		api.Get("/health", health.get)
-		api.Get("/role-catalog", roleCatalogHandler(deps.Access, deps.Desk))
-		api.Get("/den/state", den.StateHandler)
+		// Den calls this with the pairing credential. Outside RequirePaired
+		// so an unpaired module answers 404, not 503. Limited per client.
+		portalLimiter := authbase.NewRateLimiter(authbase.RateLimitOptions{Rate: 2, Burst: 20})
+		api.With(portalLimiter.Middleware).Get("/portal/todos", portalTodosHandler(den, deps.Desk))
 
-		api.Route("/v1", func(v1 chi.Router) {
-			v1.Get("/brand", brandH.get)
-			v1.Get("/brand/{role}", den.AssetHandler)
-			v1.Get("/den/state", den.StateHandler)
+		api.Group(func(gated chi.Router) {
+			gated.Use(den.RequirePaired)
+			gated.Get("/health", health.get)
+			gated.Get("/role-catalog", roleCatalogAuth(deps.Config.HRServiceToken, authMW, roleCatalogHandler(deps.Access, deps.Desk)))
+			gated.Get("/den/state", den.StateHandler)
 
-			v1.Group(func(secure chi.Router) {
-				secure.Use(authMW)
-				secure.Get("/me", meHandler(deps.Desk))
-				prefs := den.PreferencesHandler(func(r *http.Request) (string, string, bool) {
-					u, ok := auth.FromContext(r.Context())
-					if !ok || u.Issuer == "" || u.Subject == "" {
-						return "", "", false
-					}
-					return u.Issuer, u.Subject, true
+			gated.Route("/v1", func(v1 chi.Router) {
+				v1.Get("/brand", brandH.get)
+				v1.Get("/brand/{role}", den.AssetHandler)
+				v1.Get("/den/state", den.StateHandler)
+
+				v1.Group(func(secure chi.Router) {
+					secure.Use(authMW)
+					secure.Get("/me", meHandler(deps.Desk))
+					prefs := den.PreferencesHandler(func(r *http.Request) (string, string, bool) {
+						u, ok := auth.FromContext(r.Context())
+						if !ok || u.Issuer == "" || u.Subject == "" {
+							return "", "", false
+						}
+						return u.Issuer, u.Subject, true
+					})
+					secure.Get("/me/preferences", prefs)
+					secure.Put("/me/preferences", prefs)
+					secure.Get("/me/notifications", handle(dh.getNotifications))
+					secure.Put("/me/notifications", handle(dh.putNotifications))
+					secure.Route("/den", func(dr chi.Router) {
+						dr.Use(requirePermission(domain.PermSettingsManage))
+						dr.Get("/", den.StatusHandler)
+						dr.Post("/pair", den.PairHandler)
+						dr.Post("/sync", den.SyncHandler)
+						dr.Delete("/pair", den.UnpairHandler)
+					})
+
+					// Per-mailbox authorization happens in the handlers.
+					secure.Route("/mailboxes", dh.mailboxRoutes)
+					secure.Route("/conversations", dh.conversationRoutes)
+					secure.Post("/threads/{thread}/undo", handle(dh.undoThread))
+					secure.Post("/threads/{thread}/retry", handle(dh.retryThread))
+					secure.Delete("/threads/{thread}", handle(dh.deleteThread))
+					secure.Post("/threads/{thread}/restore", handle(dh.restoreThread))
+					secure.Get("/customers", handle(dh.searchCustomers))
+					secure.Get("/customers/{customer}", handle(dh.getCustomer))
+					secure.Patch("/customers/{customer}", handle(dh.updateCustomer))
+					secure.Post("/customers/{customer}/merge", handle(dh.mergeCustomer))
+					secure.Get("/attachments/{attachment}", dh.downloadAttachment)
+					secure.Get("/users", handle(dh.listPeople))
+					secure.Get("/tags", handle(dh.listTags))
+					secure.Post("/saved-replies", handle(dh.createSavedReply))
+					secure.Patch("/saved-replies/{reply}", handle(dh.updateSavedReply))
+					secure.Delete("/saved-replies/{reply}", handle(dh.deleteSavedReply))
+					secure.Get("/settings/retention", handle(dh.getRetention))
+					secure.Put("/settings/retention", handle(dh.putRetention))
+					secure.Get("/settings/integrations", handle(dh.getIntegrations))
+					secure.Get("/audit", handle(dh.auditLog))
 				})
-				secure.Get("/me/preferences", prefs)
-				secure.Put("/me/preferences", prefs)
-				secure.Get("/me/notifications", handle(dh.getNotifications))
-				secure.Put("/me/notifications", handle(dh.putNotifications))
-				secure.Route("/den", func(dr chi.Router) {
-					dr.Use(requirePermission(domain.PermSettingsManage))
-					dr.Get("/", den.StatusHandler)
-					dr.Post("/pair", den.PairHandler)
-					dr.Post("/sync", den.SyncHandler)
-					dr.Delete("/pair", den.UnpairHandler)
-				})
-
-				// Per-mailbox authorization happens in the handlers.
-				secure.Route("/mailboxes", dh.mailboxRoutes)
-				secure.Route("/conversations", dh.conversationRoutes)
-				secure.Post("/threads/{thread}/undo", handle(dh.undoThread))
-				secure.Post("/threads/{thread}/retry", handle(dh.retryThread))
-				secure.Delete("/threads/{thread}", handle(dh.deleteThread))
-				secure.Post("/threads/{thread}/restore", handle(dh.restoreThread))
-				secure.Get("/customers", handle(dh.searchCustomers))
-				secure.Get("/customers/{customer}", handle(dh.getCustomer))
-				secure.Patch("/customers/{customer}", handle(dh.updateCustomer))
-				secure.Post("/customers/{customer}/merge", handle(dh.mergeCustomer))
-				secure.Get("/attachments/{attachment}", dh.downloadAttachment)
-				secure.Get("/users", handle(dh.listPeople))
-				secure.Get("/tags", handle(dh.listTags))
-				secure.Post("/saved-replies", handle(dh.createSavedReply))
-				secure.Patch("/saved-replies/{reply}", handle(dh.updateSavedReply))
-				secure.Delete("/saved-replies/{reply}", handle(dh.deleteSavedReply))
-				secure.Get("/settings/retention", handle(dh.getRetention))
-				secure.Put("/settings/retention", handle(dh.putRetention))
-				secure.Get("/settings/integrations", handle(dh.getIntegrations))
-				secure.Get("/audit", handle(dh.auditLog))
 			})
 		})
 	})

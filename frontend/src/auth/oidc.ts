@@ -1,4 +1,4 @@
-import { UserManager, WebStorageStateStore } from 'oidc-client-ts';
+import { InMemoryWebStorage, UserManager, WebStorageStateStore, type User } from 'oidc-client-ts';
 import { runtimeConfig } from '@/runtime-config';
 
 /** True when the SPA was built for Keycloak / OIDC (Bearer tokens). */
@@ -38,10 +38,32 @@ export function getUserManager(): UserManager | null {
     automaticSilentRenew: true,
     silent_redirect_uri: `${window.location.origin}/silent-callback.html`,
     monitorSession: true,
-    // Shared by all tabs so a sign-out / user switch reaches every tab (see session.ts).
-    userStore: new WebStorageStateStore({ store: window.localStorage }),
+    // Token contract: tokens live in memory only, never in localStorage or
+    // sessionStorage. After a reload ensureUser signs in again silently.
+    userStore: new WebStorageStateStore({ store: new InMemoryWebStorage() }),
   });
   return manager;
+}
+
+let silent: Promise<User | null> | null = null;
+
+/**
+ * The signed-in user, signing in silently (hidden iframe, prompt=none)
+ * when memory holds none, for example after a reload. Null when there is
+ * no Keycloak session. Concurrent callers share one attempt.
+ */
+export async function ensureUser(): Promise<User | null> {
+  const mgr = getUserManager();
+  if (!mgr) return null;
+  const user = await mgr.getUser();
+  if (user && !user.expired) return user;
+  silent ??= mgr
+    .signinSilent()
+    .catch(() => null)
+    .finally(() => {
+      silent = null;
+    });
+  return silent;
 }
 
 export async function signInWithOidc(returnPath: string): Promise<void> {

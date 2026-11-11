@@ -9,6 +9,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 
 	"github.com/AGlElectronics/desk/backend/internal/domain"
+	"github.com/AGlElectronics/desk/backend/internal/groupmatch"
 )
 
 // AccessConfig is the in-memory snapshot of the role/permission catalog and
@@ -82,28 +83,20 @@ func (c *AccessConfig) Bindings() []GroupBinding {
 	return append([]GroupBinding(nil), c.bindings...)
 }
 
-// BindingsFor returns the bindings matching any of the token's groups.
-// Groups compare case-insensitively and ignore a leading "/" (Keycloak's
-// full-path form).
-func (c *AccessConfig) BindingsFor(groups []string) []GroupBinding {
+// BindingsFor returns the bindings matching any of the token's groups,
+// compared with the shared rule (groupmatch: case, one leading "/",
+// OIDC_GROUP_PREFIX and OIDC_GROUP_MATCH).
+func (c *AccessConfig) BindingsFor(gm groupmatch.Config, groups []string) []GroupBinding {
 	if c == nil || len(groups) == 0 {
 		return nil
 	}
-	have := map[string]struct{}{}
-	for _, g := range groups {
-		have[normalizeGroup(g)] = struct{}{}
-	}
 	var out []GroupBinding
 	for _, b := range c.bindings {
-		if _, ok := have[normalizeGroup(b.Group)]; ok {
+		if gm.Match(groups, b.Group) {
 			out = append(out, b)
 		}
 	}
 	return out
-}
-
-func normalizeGroup(g string) string {
-	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(g), "/"))
 }
 
 type accessFile struct {

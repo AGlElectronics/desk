@@ -290,7 +290,7 @@ func (s *Service) deliver(ctx context.Context, mb Mailbox, rcpts []string, raw [
 	if t := s.transportFor(mb); t != nil {
 		return t(ctx, mb, raw)
 	}
-	cfg, err := s.smtpFor(mb)
+	cfg, err := s.smtpFor(ctx, mb)
 	if err != nil {
 		return "", err
 	}
@@ -331,7 +331,7 @@ func (s *Service) sendSMTP(ctx context.Context, cfg SMTPSettings, from string, r
 }
 
 // smtpFor returns the mailbox's SMTP settings, or the module-wide ones.
-func (s *Service) smtpFor(mb Mailbox) (SMTPSettings, error) {
+func (s *Service) smtpFor(ctx context.Context, mb Mailbox) (SMTPSettings, error) {
 	if mb.SMTPHost != "" {
 		pw, err := s.decrypt(mb.ID, "smtp_password", mb.smtpPasswordEnc)
 		if err != nil {
@@ -339,15 +339,20 @@ func (s *Service) smtpFor(mb Mailbox) (SMTPSettings, error) {
 		}
 		return SMTPSettings{Host: mb.SMTPHost, Port: mb.SMTPPort, Security: mb.SMTPSecurity, Username: mb.SMTPUsername, Password: pw}, nil
 	}
-	if s.smtp.Host == "" {
-		return SMTPSettings{}, displayError{msg: "no SMTP server: set one on the mailbox or SMTP_HOST for the module"}
+	cfg, err := s.moduleSMTP(ctx)
+	if err != nil {
+		return SMTPSettings{}, err
 	}
-	cfg := s.smtp
-	cfg.moduleWide = true
+	if cfg.Host == "" {
+		return SMTPSettings{}, displayError{msg: "no SMTP server: set one on the mailbox, in Den's mail settings, or SMTP_HOST for the module"}
+	}
 	return cfg, nil
 }
 
 func (cfg SMTPSettings) label() string {
+	if cfg.fromDen {
+		return "module SMTP server (Den mail settings)"
+	}
 	if cfg.moduleWide {
 		return "module SMTP server (SMTP_HOST)"
 	}

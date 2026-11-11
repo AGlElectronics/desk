@@ -26,6 +26,12 @@ const (
 	CodeNotFound     Code = "not_found"
 	CodeConflict     Code = "conflict"
 	CodeInternal     Code = "internal"
+	// CodeTooLarge, CodeUnsupportedMedia and CodeRateLimited are authbase's
+	// codes (DecodeJSON and the rate limiter), returned unchanged.
+	CodeTooLarge         Code = "request_too_large"
+	CodeUnsupportedMedia Code = "unsupported_media_type"
+	CodeRateLimited      Code = "rate_limited"
+	CodeUnavailable      Code = "unavailable"
 )
 
 // Error is the canonical service error. Services return *Error or wrap one
@@ -141,6 +147,14 @@ func statusFor(code Code) int {
 		return http.StatusNotFound
 	case CodeConflict:
 		return http.StatusConflict
+	case CodeTooLarge:
+		return http.StatusRequestEntityTooLarge
+	case CodeUnsupportedMedia:
+		return http.StatusUnsupportedMediaType
+	case CodeRateLimited:
+		return http.StatusTooManyRequests
+	case CodeUnavailable:
+		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
 	}

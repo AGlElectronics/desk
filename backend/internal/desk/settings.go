@@ -2,7 +2,6 @@ package desk
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	"github.com/google/uuid"
@@ -74,26 +73,31 @@ func (r *Retention) set(field string, v *int) {
 	}
 }
 
-// denRetention reads "retention" from the bundle Den last sent (stored by
-// the den link in den_link.bundle). Den may send it flat or per module
-// under "desk".
-func (s *Service) denRetention(ctx context.Context) (*Retention, error) {
-	var raw []byte
-	err := s.pool.QueryRow(ctx, `SELECT bundle->'retention' FROM den_link WHERE id = 1 AND bundle IS NOT NULL`).Scan(&raw)
-	if errors.Is(err, pgx.ErrNoRows) || len(raw) == 0 || string(raw) == "null" {
+// denRetention reads desk.retention.* from Den's module settings. A key Den
+// leaves out stays on Desk's own setting. The shared retention section
+// (retention.module_data_days and the like) is not applied: those periods
+// are not the same decisions as Desk's closed-conversation and trash periods.
+func (s *Service) denRetention(context.Context) (*Retention, error) {
+	ms := s.moduleSettings()
+	if ms == nil {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, err
+	r := Retention{}
+	anySet := false
+	set := func(field, key string) {
+		d, ok := ms.Days("desk.retention." + key)
+		if !ok {
+			return
+		}
+		anySet = true
+		r.set(field, &d)
 	}
-	var wrapper struct {
-		Desk *Retention `json:"desk"`
-	}
-	if json.Unmarshal(raw, &wrapper) == nil && wrapper.Desk != nil {
-		return wrapper.Desk, nil
-	}
-	var r Retention
-	if err := json.Unmarshal(raw, &r); err != nil {
+	set("closed_conversation_days", "closed_conversation_days")
+	set("attachment_days", "attachment_days")
+	set("raw_mail_days", "raw_mail_days")
+	set("trash_days", "trash_days")
+	set("mailbox_trash_days", "mailbox_trash_days")
+	if !anySet {
 		return nil, nil
 	}
 	return &r, nil

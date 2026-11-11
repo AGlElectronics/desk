@@ -13,7 +13,7 @@ import (
 // queueEmail puts one of Desk's own emails (reminders, notifications) in
 // the outbox. Without NOTIFY_FROM nothing is queued.
 func (s *Service) queueEmail(ctx context.Context, q execer, to []string, subject, body string) error {
-	if s.notifyFrom == "" {
+	if s.notifySender() == "" {
 		return nil
 	}
 	for _, addr := range to {
@@ -29,7 +29,59 @@ func (s *Service) queueEmail(ctx context.Context, q execer, to []string, subject
 
 // NotificationsEnabled reports whether Desk can send its own emails.
 func (s *Service) NotificationsEnabled() bool {
-	return s.notifyFrom != "" && (s.smtp.Host != "" || (s.google != nil && s.google.SharedMailbox != ""))
+	return s.notifySender() != "" && (s.moduleSMTPHost() != "" || (s.google != nil && s.google.SharedMailbox != ""))
+}
+
+// notifySender is the From of Desk's own emails: NOTIFY_FROM, else Den's
+// smtp.from (with smtp.from_name), else "" (nothing is sent).
+func (s *Service) notifySender() string {
+	if s.notifyFrom != "" {
+		return s.notifyFrom
+	}
+	if d, ok := s.moduleSettings().SMTP(); ok && d.From != "" {
+		return (&mail.Address{Name: d.FromName, Address: d.From}).String()
+	}
+	return ""
+}
+
+// denSMTP is Den's mail server (module settings smtp.*), without password.
+func (s *Service) denSMTP() (SMTPSettings, bool) {
+	d, ok := s.moduleSettings().SMTP()
+	if !ok {
+		return SMTPSettings{}, false
+	}
+	return SMTPSettings{Host: d.Host, Port: d.Port, Security: d.Security, Username: d.Username, moduleWide: true, fromDen: true}, true
+}
+
+func (s *Service) moduleSMTPHost() string {
+	if d, ok := s.denSMTP(); ok {
+		return d.Host
+	}
+	return s.smtp.Host
+}
+
+// moduleSMTP is the module-wide mail server: Den's when Den sets smtp.host
+// (its password fetched from Den when it holds one), else SMTP_*.
+func (s *Service) moduleSMTP(ctx context.Context) (SMTPSettings, error) {
+	if cfg, ok := s.denSMTP(); ok {
+		if pwSet, _ := s.moduleSettings().Bool("smtp.password_set"); pwSet {
+			if s.denSMTPPassword == nil {
+				return cfg, displayError{msg: "Den holds the SMTP password, but Desk cannot fetch it"}
+			}
+			pw, err := s.denSMTPPassword(ctx)
+			if err != nil {
+				return cfg, displayError{msg: "could not fetch the SMTP password from Den", err: err}
+			}
+			cfg.Password = pw
+		}
+		return cfg, nil
+	}
+	if s.smtp.Host == "" {
+		return SMTPSettings{}, nil
+	}
+	cfg := s.smtp
+	cfg.moduleWide = true
+	return cfg, nil
 }
 
 func (s *Service) sendOutbox(ctx context.Context, log zerolog.Logger) {
@@ -74,12 +126,12 @@ func (s *Service) sendOutbox(ctx context.Context, log zerolog.Logger) {
 	_, _ = s.pool.Exec(db, `DELETE FROM outbox WHERE status = 'sent' AND sent_at < now() - interval '30 days'`)
 }
 
-// sendNotification uses the module SMTP server, or the Google shared
-// account when there is no SMTP_HOST.
+// sendNotification uses the module SMTP server (Den's or SMTP_HOST), or the
+// Google shared account when there is none.
 func (s *Service) sendNotification(ctx context.Context, to, subject, text string, log zerolog.Logger) error {
-	from, err := mail.ParseAddress(s.notifyFrom)
+	from, err := mail.ParseAddress(s.notifySender())
 	if err != nil {
-		return displayError{msg: "NOTIFY_FROM is not a valid address"}
+		return displayError{msg: "NOTIFY_FROM (or Den's smtp.from) is not a valid address"}
 	}
 	raw, err := buildMessage(outgoing{
 		FromName: from.Name, From: from.Address, To: []string{to}, Subject: subject,
@@ -90,9 +142,11 @@ func (s *Service) sendNotification(ctx context.Context, to, subject, text string
 	if err != nil {
 		return err
 	}
-	if s.smtp.Host != "" {
-		cfg := s.smtp
-		cfg.moduleWide = true
+	cfg, err := s.moduleSMTP(ctx)
+	if err != nil {
+		return err
+	}
+	if cfg.Host != "" {
 		return s.sendSMTP(ctx, cfg, from.Address, []string{to}, raw, log)
 	}
 	if s.google != nil && s.google.SharedMailbox != "" {

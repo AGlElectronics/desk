@@ -6,6 +6,7 @@ import (
 
 	"github.com/AGlElectronics/desk/backend/internal/auth"
 	"github.com/AGlElectronics/desk/backend/internal/desk"
+	"github.com/AGlElectronics/desk/backend/internal/groupmatch"
 	"github.com/AGlElectronics/desk/backend/internal/httperror"
 )
 
@@ -40,7 +41,11 @@ func meHandler(svc *desk.Service) http.HandlerFunc {
 		if perms == nil {
 			perms = []string{}
 		}
-		a := accessOf(u)
+		gm := groupmatch.Config{}
+		if svc != nil {
+			gm = svc.GroupMatch()
+		}
+		a := accessOf(u, gm)
 		mailboxes := []meMailbox{}
 		if svc != nil {
 			boxes, err := svc.VisibleMailboxes(r.Context(), a)

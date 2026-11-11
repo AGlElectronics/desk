@@ -17,22 +17,31 @@ import (
 
 	"github.com/joho/godotenv"
 
-	"github.com/AGlElectronics/desk/backend/internal/clientip"
+	"github.com/AGlElectronics/desk/backend/internal/authbase"
 	"github.com/AGlElectronics/desk/backend/internal/denlink"
+	"github.com/AGlElectronics/desk/backend/internal/groupmatch"
+	"github.com/AGlElectronics/desk/backend/internal/gworkspace"
 )
 
-// AuthMode selects how incoming requests are authenticated.
+// AuthMode selects how incoming requests are authenticated (authbase).
 //
 //   - AuthModeDev reads an X-Dev-User header (identity) and an X-Dev-Groups
 //     header (simulated IdP groups) and provisions a local user tied to the
-//     "dev" issuer. Only safe for local scaffolding and CI.
-//   - AuthModeOIDC verifies a Bearer JWT via the configured issuer.
-type AuthMode string
+//     "dev" issuer. Only allowed with APP_ENV=development.
+//   - AuthModeOIDC verifies a Bearer access token via the configured issuer.
+type AuthMode = authbase.AuthMode
 
 const (
-	AuthModeOIDC AuthMode = "oidc"
-	AuthModeDev  AuthMode = "dev"
+	AuthModeOIDC = authbase.AuthOIDC
+	AuthModeDev  = authbase.AuthDev
 )
+
+// DefaultAudience is OIDC_AUDIENCE when unset: the access token audience
+// Keycloak adds for Desk's API (token contract).
+const DefaultAudience = "desk-api"
+
+// MinServiceTokenLength is the shortest accepted HR_SERVICE_TOKEN.
+const MinServiceTokenLength = 32
 
 // EnvDevelopment is the only APP_ENV that unlocks development shortcuts
 // (built-in secret key, plaintext mail connections, the fake Google
@@ -48,7 +57,7 @@ const MinFetchInterval = 5 * time.Second
 
 // Config is the validated process configuration.
 type Config struct {
-	// Core
+	// Core. AppEnv defaults to production; only "development" relaxes rules.
 	AppEnv     string
 	AppBaseURL string
 	HTTPAddr   string
@@ -64,21 +73,24 @@ type Config struct {
 	AccessConfigPath string
 	DevDefaultUser   string
 	DevDefaultGroups []string
+	// GroupMatch is OIDC_GROUPS_CLAIM, OIDC_GROUP_MATCH, OIDC_GROUP_PREFIX.
+	GroupMatch groupmatch.Config
+	// HRServiceToken lets HR read GET /api/role-catalog without a sign-in
+	// (HR_SERVICE_TOKEN). Empty: only signed-in staff may read it.
+	HRServiceToken string
 
 	// Brand provider
 	BrandLocalPath string // optional brand.json; Den's brand overlays it once paired
-	// DenInternalURL replaces the host of pasted Den pairing URLs (Docker).
-	DenInternalURL string
-	// DenMode is DEN_MODE: required keeps the API locked until the module
-	// is paired with Den; standalone (the default) does not.
-	DenMode denlink.Mode
+	// Den is the pairing configuration (DEN_MODE, DEN_INTERNAL_URL,
+	// DEN_ALLOWED_HOSTS, DEN_LINK_ENCRYPTION_KEY[_PREVIOUS], APP_ENV).
+	Den denlink.Config
 
 	// HTTP
 	CORSAllowedOrigins []string
-	// TrustedProxyCIDRs lists the proxies whose X-Forwarded-For entries are
+	// TrustedProxies are the proxies whose X-Forwarded-For entries are
 	// believed when working out the client IP (TRUSTED_PROXY_CIDRS).
-	TrustedProxyCIDRs []netip.Prefix
-	ShutdownTimeout   time.Duration
+	TrustedProxies  authbase.TrustedProxies
+	ShutdownTimeout time.Duration
 
 	// Secrets at rest
 	// SecretKey encrypts mailbox passwords (DESK_SECRET_KEY).
@@ -103,12 +115,13 @@ type Config struct {
 	// NotifyFrom is the From address of Desk's own notifications.
 	NotifyFrom string
 
-	// Google Workspace connector (empty domain: off).
-	GoogleDomain             string
-	GoogleServiceAccountFile string
-	GoogleAdminUser          string
-	GoogleSharedMailbox      string
-	GoogleLabel              string
+	// Google Workspace connector (empty domain: off): GOOGLE_WORKSPACE_DOMAIN,
+	// GOOGLE_WORKSPACE_CREDENTIALS_FILE, GOOGLE_WORKSPACE_ADMIN_EMAIL.
+	GoogleDomain          string
+	GoogleCredentialsFile string
+	GoogleAdminEmail      string
+	GoogleSharedMailbox   string
+	GoogleLabel           string
 	// GoogleFake uses an in-memory Workspace (development only).
 	GoogleFake bool
 
@@ -122,7 +135,36 @@ type Config struct {
 }
 
 // IsDevelopment reports whether APP_ENV is development.
-func (c *Config) IsDevelopment() bool { return c.AppEnv == EnvDevelopment }
+func (c *Config) IsDevelopment() bool { return authbase.NormalizeAppEnv(c.AppEnv) == EnvDevelopment }
+
+// Auth is the authbase view of AUTH_MODE, APP_ENV and TRUSTED_PROXY_CIDRS.
+func (c *Config) Auth() authbase.Config {
+	return authbase.Config{AppEnv: c.AppEnv, AuthMode: c.AuthMode, TrustedProxies: c.TrustedProxies}
+}
+
+// Audience is the audience access tokens must carry.
+func (c *Config) Audience() string {
+	if c.OIDCAudience != "" {
+		return c.OIDCAudience
+	}
+	return DefaultAudience
+}
+
+// DenConfig is Den with the slug and version filled in, and APP_ENV taken
+// from the process when Den does not set its own.
+func (c *Config) DenConfig(version string) denlink.Config {
+	d := c.Den
+	d.Slug, d.Version = "desk", version
+	if d.AppEnv == "" {
+		d.AppEnv = c.AppEnv
+	}
+	return d
+}
+
+// Workspace is the gworkspace view of the GOOGLE_WORKSPACE_* settings.
+func (c *Config) Workspace() gworkspace.Config {
+	return gworkspace.Config{CredentialsFile: c.GoogleCredentialsFile, AdminEmail: c.GoogleAdminEmail, Domain: c.GoogleDomain}
+}
 
 // GoogleEnabled reports whether the Google Workspace connector is configured.
 func (c *Config) GoogleEnabled() bool { return c.GoogleDomain != "" }
@@ -178,9 +220,34 @@ func load(lookup func(string) (string, bool)) (*Config, error) {
 		}
 		return b
 	}
+	getenv := func(key string) string {
+		v, _ := lookup(key)
+		return v
+	}
+
+	auth, err := authbase.FromEnv(getenv)
+	if err != nil {
+		errs = append(errs, err.Error())
+	}
+	groups, err := groupmatch.FromEnv(getenv)
+	if err != nil {
+		errs = append(errs, err.Error())
+	}
+	den, err := denlink.FromEnv("desk", "", getenv)
+	if err != nil {
+		errs = append(errs, err.Error())
+	}
+	for old, repl := range map[string]string{
+		"GOOGLE_SERVICE_ACCOUNT_FILE": gworkspace.EnvCredentialsFile,
+		"GOOGLE_ADMIN_USER":           gworkspace.EnvAdminEmail,
+	} {
+		if env(old, "") != "" {
+			errs = append(errs, fmt.Sprintf("%s was renamed to %s", old, repl))
+		}
+	}
 
 	cfg := &Config{
-		AppEnv: env("APP_ENV", EnvDevelopment),
+		AppEnv: auth.AppEnv,
 		// Container-internal defaults: every module in the ecosystem binds
 		// :8080 inside its container. Host-side port mapping (host 8150 ->
 		// container 8080 for Desk) is handled by docker-compose / K8s.
@@ -189,19 +256,21 @@ func load(lookup func(string) (string, bool)) (*Config, error) {
 
 		DatabaseURL: env("DATABASE_URL", ""),
 
-		AuthMode:         AuthMode(env("AUTH_MODE", "dev")),
+		AuthMode:         auth.AuthMode,
 		OIDCIssuerURL:    env("OIDC_ISSUER_URL", ""),
 		OIDCClientID:     env("OIDC_CLIENT_ID", ""),
-		OIDCAudience:     env("OIDC_AUDIENCE", ""),
+		OIDCAudience:     env("OIDC_AUDIENCE", DefaultAudience),
 		AccessConfigPath: env("ACCESS_CONFIG_PATH", ""),
 		DevDefaultUser:   env("DEV_DEFAULT_USER", "dev-admin"),
 		DevDefaultGroups: splitCSV(env("DEV_DEFAULT_GROUPS", "desk-admin")),
+		GroupMatch:       groups,
+		HRServiceToken:   env("HR_SERVICE_TOKEN", ""),
 
 		BrandLocalPath: env("BRAND_LOCAL_PATH", ""),
-		DenInternalURL: env("DEN_INTERNAL_URL", ""),
-		DenMode:        denlink.Mode(env("DEN_MODE", string(denlink.ModeStandalone))),
+		Den:            den,
 
 		CORSAllowedOrigins: splitCSV(env("CORS_ALLOWED_ORIGINS", "http://localhost:3008")),
+		TrustedProxies:     auth.TrustedProxies,
 		ShutdownTimeout:    duration("SHUTDOWN_TIMEOUT", 15*time.Second),
 
 		SecretKey:          env("DESK_SECRET_KEY", ""),
@@ -216,12 +285,12 @@ func load(lookup func(string) (string, bool)) (*Config, error) {
 		SMTPPassword:     env("SMTP_PASSWORD", ""),
 		NotifyFrom:       env("NOTIFY_FROM", ""),
 
-		GoogleDomain:             strings.ToLower(env("GOOGLE_WORKSPACE_DOMAIN", "")),
-		GoogleServiceAccountFile: env("GOOGLE_SERVICE_ACCOUNT_FILE", ""),
-		GoogleAdminUser:          env("GOOGLE_ADMIN_USER", ""),
-		GoogleSharedMailbox:      strings.ToLower(env("GOOGLE_SHARED_MAILBOX", "")),
-		GoogleLabel:              env("GOOGLE_LABEL", "Desk"),
-		GoogleFake:               boolean("GOOGLE_FAKE", false),
+		GoogleDomain:          strings.ToLower(env(gworkspace.EnvDomain, "")),
+		GoogleCredentialsFile: env(gworkspace.EnvCredentialsFile, ""),
+		GoogleAdminEmail:      strings.ToLower(env(gworkspace.EnvAdminEmail, "")),
+		GoogleSharedMailbox:   strings.ToLower(env("GOOGLE_SHARED_MAILBOX", "")),
+		GoogleLabel:           env("GOOGLE_LABEL", "Desk"),
+		GoogleFake:            boolean("GOOGLE_FAKE", false),
 
 		S3Endpoint:        env("S3_ENDPOINT", ""),
 		S3Bucket:          env("S3_BUCKET", ""),
@@ -233,15 +302,9 @@ func load(lookup func(string) (string, bool)) (*Config, error) {
 
 	// The built-in key needs APP_ENV=development set on purpose: a missing
 	// APP_ENV must never select it.
-	if appEnv, _ := lookup("APP_ENV"); cfg.SecretKey == "" && strings.TrimSpace(appEnv) == EnvDevelopment {
+	if appEnv, _ := lookup("APP_ENV"); cfg.SecretKey == "" && authbase.NormalizeAppEnv(appEnv) == EnvDevelopment {
 		cfg.SecretKey = DevSecretKey
 	}
-
-	trusted, err := clientip.ParseCIDRs(env("TRUSTED_PROXY_CIDRS", clientip.DefaultTrustedProxies))
-	if err != nil {
-		errs = append(errs, "TRUSTED_PROXY_CIDRS: "+err.Error())
-	}
-	cfg.TrustedProxyCIDRs = trusted
 
 	errs = append(errs, cfg.validate()...)
 	if len(errs) > 0 {
@@ -257,8 +320,8 @@ func (c *Config) validate() []string {
 	if c.DatabaseURL == "" {
 		errs = append(errs, "DATABASE_URL is required")
 	}
-	if err := c.DenMode.Validate(); err != nil {
-		errs = append(errs, err.Error())
+	if t := c.HRServiceToken; t != "" && len(t) < MinServiceTokenLength {
+		errs = append(errs, fmt.Sprintf("HR_SERVICE_TOKEN must be at least %d characters (openssl rand -base64 32)", MinServiceTokenLength))
 	}
 
 	switch {
@@ -311,11 +374,10 @@ func (c *Config) validate() []string {
 		errs = append(errs, "GOOGLE_FAKE is only allowed with APP_ENV=development")
 	}
 	if c.GoogleEnabled() {
-		if !c.GoogleFake && c.GoogleServiceAccountFile == "" {
-			errs = append(errs, "GOOGLE_SERVICE_ACCOUNT_FILE is required when GOOGLE_WORKSPACE_DOMAIN is set")
-		}
-		if !c.GoogleFake && c.GoogleAdminUser == "" {
-			errs = append(errs, "GOOGLE_ADMIN_USER is required when GOOGLE_WORKSPACE_DOMAIN is set")
+		if !c.GoogleFake {
+			if err := c.Workspace().Validate(); err != nil {
+				errs = append(errs, err.Error())
+			}
 		}
 		if c.GoogleSharedMailbox != "" && !strings.HasSuffix(c.GoogleSharedMailbox, "@"+c.GoogleDomain) {
 			errs = append(errs, "GOOGLE_SHARED_MAILBOX must be an address in GOOGLE_WORKSPACE_DOMAIN")
@@ -352,8 +414,7 @@ func (c *Config) validate() []string {
 		}
 	case AuthModeDev:
 		// dev mode: no extra required fields; dev users auto-provision.
-	default:
-		errs = append(errs, fmt.Sprintf("AUTH_MODE must be 'oidc' or 'dev', got %q", c.AuthMode))
+		// authbase.FromEnv already refused it outside development.
 	}
 	return errs
 }

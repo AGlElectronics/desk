@@ -451,18 +451,21 @@ func (s *Service) applyUpdate(ctx context.Context, tx pgx.Tx, c Conversation, ac
 			return err
 		}
 	} else if in.AssigneeID != nil && (c.AssigneeID == nil || *c.AssigneeID != *in.AssigneeID) {
-		var name string
-		var mayWork bool
+		var name, slug string
+		var admin bool
+		var groups []string
 		err := tx.QueryRow(ctx, `
-			SELECT u.display_name, u.desk_admin OR ('desk-' || m.slug || '-manager') = ANY(u.groups) OR u.id = $3
+			SELECT u.display_name, u.desk_admin, u.groups, m.slug
 			  FROM users u, conversations c JOIN mailboxes m ON m.id = c.mailbox_id
-			 WHERE u.id = $1 AND c.id = $2`, *in.AssigneeID, c.ID, actorID).Scan(&name, &mayWork)
+			 WHERE u.id = $1 AND c.id = $2`, *in.AssigneeID, c.ID).Scan(&name, &admin, &groups, &slug)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return httperror.Validation("unknown assignee", map[string]string{"assignee_id": "not a Desk user"})
 		}
 		if err != nil {
 			return err
 		}
+		mayWork := admin || actorID == *in.AssigneeID ||
+			HasMailboxRole(s.groups, groups, slug, domain.LevelManager)
 		if !mayWork {
 			return httperror.Validation("assignee cannot work this mailbox", map[string]string{"assignee_id": "needs the manager role of this mailbox"})
 		}

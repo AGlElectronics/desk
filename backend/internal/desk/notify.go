@@ -47,23 +47,27 @@ func (s *Service) conversationURL(id uuid.UUID) string {
 
 // notifyNewConversation emails everyone who wants it and can see mb.
 func (s *Service) notifyNewConversation(ctx context.Context, tx pgx.Tx, mb Mailbox, convID uuid.UUID, number int, subject, from string) error {
-	if s.notifyFrom == "" {
+	if s.notifySender() == "" {
 		return nil
 	}
-	groups := []string{}
+	grants := []string{}
 	for _, l := range domain.MailboxLevels() {
-		groups = append(groups, domain.MailboxGroup(mb.Slug, l))
+		grants = append(grants, domain.MailboxGroup(mb.Slug, l))
 	}
+	// Groups are matched in Go (groupmatch): OIDC_GROUP_PREFIX and
+	// OIDC_GROUP_MATCH=last make SQL equality miss.
 	rows, err := tx.Query(ctx, `
-		SELECT u.email FROM users u JOIN notification_prefs p ON p.user_id = u.id
-		 WHERE p.new_conversation AND COALESCE(u.email, '') <> '' AND (u.desk_admin OR u.groups && $1)`, groups)
+		SELECT u.email, u.desk_admin, u.groups FROM users u JOIN notification_prefs p ON p.user_id = u.id
+		 WHERE p.new_conversation AND COALESCE(u.email, '') <> ''`)
 	if err != nil {
 		return err
 	}
 	var to []string
 	for rows.Next() {
 		var e string
-		if rows.Scan(&e) == nil {
+		var admin bool
+		var groups []string
+		if rows.Scan(&e, &admin, &groups) == nil && (admin || s.groups.MatchAny(groups, grants)) {
 			to = append(to, e)
 		}
 	}
@@ -75,7 +79,7 @@ func (s *Service) notifyNewConversation(ctx context.Context, tx pgx.Tx, mb Mailb
 
 // notifyAssigned emails the new assignee if they want it.
 func (s *Service) notifyAssigned(ctx context.Context, tx pgx.Tx, mb Mailbox, c Conversation, assignee uuid.UUID, actor *Person) error {
-	if s.notifyFrom == "" {
+	if s.notifySender() == "" {
 		return nil
 	}
 	var email string

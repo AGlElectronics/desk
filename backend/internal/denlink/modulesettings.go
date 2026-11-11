@@ -167,8 +167,8 @@ func (m *ModuleSettings) Retention() Retention {
 }
 
 // SMTP is the "smtp" section. The password never travels in the bundle:
-// PasswordSet says Den holds one, and the module fetches it from
-// GET /api/v1/integrations/module-settings/secrets when it sends mail.
+// PasswordSet says Den holds one, and the module fetches it with
+// Client.SMTPPassword when it sends mail.
 type SMTP struct {
 	Host        string `json:"host"`
 	Port        int    `json:"port"`

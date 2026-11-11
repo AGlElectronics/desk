@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AGlElectronics/desk/backend/internal/domain"
+	"github.com/AGlElectronics/desk/backend/internal/groupmatch"
 )
 
 // Resolver turns an authenticated external identity (OIDC claims, or a dev
@@ -31,13 +32,14 @@ import (
 type Resolver struct {
 	pool   *pgxpool.Pool
 	access *AccessConfig
+	groups groupmatch.Config
 	orgIDs sync.Map // organization slug -> uuid.UUID
 }
 
 // NewResolver constructs a Resolver backed by the given pool and access
-// config catalog.
-func NewResolver(pool *pgxpool.Pool, access *AccessConfig) *Resolver {
-	return &Resolver{pool: pool, access: access}
+// config catalog; groups are matched to bindings with gm.
+func NewResolver(pool *pgxpool.Pool, access *AccessConfig, gm groupmatch.Config) *Resolver {
+	return &Resolver{pool: pool, access: access, groups: gm}
 }
 
 // LoadOrProvisionDevUser is used by the dev bypass middleware. The user
@@ -57,8 +59,8 @@ func (r *Resolver) LoadOrProvisionDevUser(ctx context.Context, name string, grou
 	if err != nil {
 		return nil, fmt.Errorf("resolve dev group bindings: %w", err)
 	}
-	norm := NormalizeGroups(groups)
-	userID, err := r.upsertUser(ctx, "dev", name, display, &email, norm, r.isAdmin(memberships))
+	norm, displayGroups := splitStoredGroups(groups)
+	userID, err := r.upsertUser(ctx, "dev", name, display, &email, norm, displayGroups, r.isAdmin(memberships))
 	if err != nil {
 		return nil, fmt.Errorf("provision dev user: %w", err)
 	}
@@ -77,17 +79,30 @@ func (r *Resolver) isAdmin(memberships []Membership) bool {
 	return false
 }
 
-// NormalizeGroups lower-cases groups and drops Keycloak's leading "/".
+// NormalizeGroups returns the groups in groupmatch's stored form (trimmed,
+// one leading "/" removed, lower case), without duplicates. The prefix and
+// the match mode are applied only when comparing, so stored groups stay
+// valid when OIDC_GROUP_PREFIX or OIDC_GROUP_MATCH change.
 func NormalizeGroups(groups []string) []string {
-	out := make([]string, 0, len(groups))
+	stored, _ := splitStoredGroups(groups)
+	return stored
+}
+
+// splitStoredGroups returns the normalised form (users.groups) and the
+// display form (users.groups_display, the name as the token sent it).
+func splitStoredGroups(groups []string) (stored, display []string) {
+	stored, display = []string{}, []string{}
 	seen := map[string]bool{}
 	for _, g := range groups {
-		if n := normalizeGroup(g); n != "" && !seen[n] {
-			seen[n] = true
-			out = append(out, n)
+		grant := groupmatch.NewGrant(g)
+		if grant.Stored == "" || seen[grant.Stored] {
+			continue
 		}
+		seen[grant.Stored] = true
+		stored = append(stored, grant.Stored)
+		display = append(display, grant.Display)
 	}
-	return out
+	return stored, display
 }
 
 // LoadOrProvisionOIDCUser is called by the OIDC middleware after a
@@ -107,8 +122,8 @@ func (r *Resolver) LoadOrProvisionOIDCUser(ctx context.Context, claims *OIDCClai
 	if err != nil {
 		return nil, fmt.Errorf("resolve group bindings: %w", err)
 	}
-	norm := NormalizeGroups(claims.Groups)
-	userID, err := r.upsertUser(ctx, claims.Issuer, claims.Subject, display, emailPtr, norm, r.isAdmin(memberships))
+	norm, displayGroups := splitStoredGroups(claims.Groups)
+	userID, err := r.upsertUser(ctx, claims.Issuer, claims.Subject, display, emailPtr, norm, displayGroups, r.isAdmin(memberships))
 	if err != nil {
 		return nil, fmt.Errorf("upsert oidc user: %w", err)
 	}
@@ -131,22 +146,23 @@ func (r *Resolver) upsertUser(
 	ctx context.Context,
 	issuer, subject, display string,
 	email *string,
-	groups []string,
+	groups, groupsDisplay []string,
 	admin bool,
 ) (uuid.UUID, error) {
 	var userID uuid.UUID
 	err := r.pool.QueryRow(ctx,
-		`INSERT INTO users (issuer, subject, display_name, email, last_login_at, groups, desk_admin)
-		 VALUES ($1, $2, $3, $4, now(), $5, $6)
+		`INSERT INTO users (issuer, subject, display_name, email, last_login_at, groups, groups_display, desk_admin)
+		 VALUES ($1, $2, $3, $4, now(), $5, $6, $7)
 		 ON CONFLICT (issuer, subject) DO UPDATE
-		    SET display_name  = EXCLUDED.display_name,
-		        email         = COALESCE(EXCLUDED.email, users.email),
-		        last_login_at = now(),
-		        groups        = EXCLUDED.groups,
-		        desk_admin    = EXCLUDED.desk_admin,
-		        updated_at    = now()
+		    SET display_name   = EXCLUDED.display_name,
+		        email          = COALESCE(EXCLUDED.email, users.email),
+		        last_login_at  = now(),
+		        groups         = EXCLUDED.groups,
+		        groups_display = EXCLUDED.groups_display,
+		        desk_admin     = EXCLUDED.desk_admin,
+		        updated_at     = now()
 		 RETURNING id`,
-		issuer, subject, display, email, groups, admin,
+		issuer, subject, display, email, groups, groupsDisplay, admin,
 	).Scan(&userID)
 	if err != nil {
 		return uuid.Nil, err
@@ -229,7 +245,7 @@ func displayNameFromClaims(c *OIDCClaims) string {
 // Bindings naming an organization slug that does not exist grant nothing.
 func (r *Resolver) groupMemberships(ctx context.Context, groups []string) ([]Membership, error) {
 	var out []Membership
-	for _, b := range r.access.BindingsFor(groups) {
+	for _, b := range r.access.BindingsFor(r.groups, groups) {
 		orgID, ok, err := r.orgIDBySlug(ctx, b.Organization)
 		if err != nil {
 			return nil, err

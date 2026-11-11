@@ -446,7 +446,7 @@ func (s *Service) TestConnection(ctx context.Context, id uuid.UUID, log zerolog.
 		_ = c.Logout().Wait()
 		c.Close()
 	}
-	cfg, err := s.smtpFor(mb)
+	cfg, err := s.smtpFor(ctx, mb)
 	if err != nil {
 		out.SMTPError = describeMailError(err)
 		return out, nil

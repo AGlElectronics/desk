@@ -39,7 +39,7 @@ func newAPI(t *testing.T) *apiEnv {
 	keys, _ := secretbox.New("test-key")
 	blobs := blob.NewMemory()
 	svc := desk.NewService(pool, desk.Options{Keyring: keys, Development: true, Blobs: blobs})
-	cfg := &config.Config{AuthMode: config.AuthModeDev, DevDefaultUser: "nobody", DenMode: denlink.ModeStandalone}
+	cfg := &config.Config{AppEnv: "development", AuthMode: config.AuthModeDev, DevDefaultUser: "nobody", Den: denlink.Config{Mode: denlink.ModeStandalone}}
 	den := denlink.New(pool, denlink.Config{Slug: "desk", Mode: denlink.ModeStandalone}, zerolog.Nop())
 	srv := httptest.NewServer(NewRouter(Deps{Config: cfg, Pool: pool, Logger: zerolog.Nop(), Access: access, Den: den, Desk: svc}, "test"))
 	t.Cleanup(srv.Close)

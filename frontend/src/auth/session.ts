@@ -4,13 +4,11 @@ import { setUnauthorizedHandler } from '@/api/client';
 import { getUserManager } from '@/auth/oidc';
 
 /*
- * Keeps every tab on the identity Keycloak currently has. The OIDC user lives
- * in localStorage (shared by all tabs of this app), so:
- *  - another tab signs out            -> this tab goes to the login page
- *  - another tab signs in as someone  -> this tab reloads as that person
- *  - Keycloak session ends elsewhere   -> session monitor signs this tab out
- *  - the API answers 401               -> back to the login page
- * Without this, a tab kept a stale admin token after a user switch.
+ * The access token lives in memory (see oidc.ts). This tab still follows the
+ * Keycloak session:
+ *  - Keycloak session ends elsewhere -> session monitor signs this tab out
+ *  - the API answers 401             -> back to the login page
+ * A reload has no stored token; ensureUser signs in again silently.
  */
 
 const USER_KEY_PREFIX = 'oidc.user:';

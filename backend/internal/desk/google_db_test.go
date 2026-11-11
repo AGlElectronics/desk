@@ -2,6 +2,7 @@ package desk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -11,9 +12,14 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/AGlElectronics/desk/backend/internal/blob"
+	"github.com/AGlElectronics/desk/backend/internal/denlink"
 	"github.com/AGlElectronics/desk/backend/internal/mailprovider"
 	"github.com/AGlElectronics/desk/backend/internal/testdb"
 )
+
+type retentionSource struct{ ms *denlink.ModuleSettings }
+
+func (r retentionSource) ModuleSettings() *denlink.ModuleSettings { return r.ms }
 
 const shared = "desk@example.org"
 
@@ -276,10 +282,11 @@ func TestDenRetentionOverridesDesk(t *testing.T) {
 	if _, err := e.svc.SetRetention(ctx, Retention{ClosedConversationDays: ptr(730)}, e.anna); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.svc.pool.Exec(ctx, `INSERT INTO den_link (den_base_url, credential, bundle) VALUES ('https://den', 'x', $1)`,
-		[]byte(`{"retention":{"desk":{"mailbox_trash_days":10,"raw_mail_days":90}}}`)); err != nil {
+	var ms denlink.ModuleSettings
+	if err := json.Unmarshal([]byte(`{"data":{"desk":{"retention":{"mailbox_trash_days":10,"raw_mail_days":90}}}}`), &ms); err != nil {
 		t.Fatal(err)
 	}
+	e.svc.den = retentionSource{ms: &ms}
 	v, _ = e.svc.RetentionSettings(ctx)
 	if *v.Effective.MailboxTrashDays != 10 || *v.Effective.RawMailDays != 90 || *v.Effective.ClosedConversationDays != 730 {
 		t.Fatalf("effective %+v", v.Effective)

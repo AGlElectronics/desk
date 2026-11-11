@@ -88,13 +88,16 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	}
 
 	brandProvider := brand.New(cfg)
-	den := denlink.New(pool, denlink.Config{Slug: "desk", Version: Version, InternalURL: cfg.DenInternalURL, Mode: cfg.DenMode}, logger)
+	den, err := denlink.Open(pool, cfg.DenConfig(Version), logger)
+	if err != nil {
+		return fmt.Errorf("den link: %w", err)
+	}
 	if err := den.Restore(ctx); err != nil {
 		logger.Warn().Err(err).Msg("den link: load failed")
 	}
 	go den.Run(ctx)
 
-	deskSvc, err := newDeskService(ctx, pool, cfg)
+	deskSvc, err := newDeskService(ctx, pool, cfg, den)
 	if err != nil {
 		return err
 	}
@@ -136,7 +139,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	return runServer(ctx, server, stopWorkers, cfg.ShutdownTimeout, logger)
 }
 
-func newDeskService(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config) (*desk.Service, error) {
+func newDeskService(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, den *denlink.Client) (*desk.Service, error) {
 	keys, err := secretbox.New(cfg.SecretKey, cfg.PreviousSecretKeys...)
 	if err != nil {
 		return nil, fmt.Errorf("secret key: %w", err)
@@ -159,20 +162,33 @@ func newDeskService(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config)
 		Google:     google,
 		NotifyFrom: cfg.NotifyFrom,
 		BaseURL:    cfg.AppBaseURL,
-		Keyring: keys,
+		Keyring:    keys,
 		SMTP: desk.SMTPSettings{
 			Host: cfg.SMTPHost, Port: cfg.SMTPPort, Security: cfg.SMTPSecurity,
 			Username: cfg.SMTPUsername, Password: cfg.SMTPPassword,
 		},
 		Development:      cfg.IsDevelopment(),
 		AllowedMailHosts: cfg.AllowedMailHosts,
+		GroupMatch:       cfg.GroupMatch,
+		Den:              den,
+		DenSMTPPassword: func(ctx context.Context) (string, error) {
+			if den == nil {
+				return "", denlink.ErrNotPaired
+			}
+			return den.SMTPPassword(ctx)
+		},
 	}), nil
 }
 
-// GoogleProvider builds the Google Workspace client (Gmail API and Admin
-// SDK with domain-wide delegation) from GOOGLE_*. This version of Desk
-// ships without one; the client from shared/go/gworkspace sets it.
+// GoogleProvider builds the Workspace client. The default, set in init,
+// is the shared gworkspace REST client. Tests may replace it.
 var GoogleProvider func(ctx context.Context, cfg *config.Config) (mailprovider.Provider, error)
+
+func init() {
+	GoogleProvider = func(_ context.Context, cfg *config.Config) (mailprovider.Provider, error) {
+		return mailprovider.NewGoogle(cfg.Workspace())
+	}
+}
 
 func googleOptions(ctx context.Context, cfg *config.Config) (*desk.GoogleOptions, error) {
 	if !cfg.GoogleEnabled() {
@@ -212,7 +228,7 @@ func Reencrypt(ctx context.Context, logger zerolog.Logger) error {
 		return fmt.Errorf("open db: %w", err)
 	}
 	defer pool.Close()
-	svc, err := newDeskService(ctx, pool, cfg)
+	svc, err := newDeskService(ctx, pool, cfg, nil)
 	if err != nil {
 		return err
 	}

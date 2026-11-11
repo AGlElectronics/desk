@@ -1,0 +1,74 @@
+# Security headers for a Con Services web app (the nginx that serves the
+# React frontend), as a template the official nginx image fills in when the
+# container starts. Source: con-services shared/nginx/security-headers.conf.template.
+# Docs: https://aglelectronics.github.io/con-services/concepts/shared-code/#nginx-security-headers
+#
+# Nothing fills in the ${...} placeholders when this file is copied: the
+# sync script copies only Go code, and you copy this file by hand. The
+# official nginx image's entrypoint (20-envsubst-on-templates.sh) fills them
+# in from the container's environment every time the container starts.
+# Charts pass the four variables as env on the frontend container; never
+# bake a filled-in copy into the image or a ConfigMap.
+#
+# The image is the same for every installation; the origins the browser may
+# talk to besides the app come from environment variables (scheme + host
+# (+ port), no path; several separated by spaces; empty leaves them out):
+#   KEYCLOAK_ORIGIN    the sign-in server, e.g. https://auth.con.example.org
+#   DEN_ORIGIN         Den, e.g. https://den.con.example.org, when the
+#                      browser calls Den or loads Den-hosted assets
+#   S3_ORIGIN          the S3 storage the browser uploads to (and shows
+#                      uploaded images from), e.g. https://s3.con.example.org
+#   EXTRA_CONNECT_SRC  anything else the browser calls (connect-src only)
+#
+# How to use it:
+#   1. Copy this file into the app (for example infra/security-headers.conf.template).
+#   2. In the Dockerfile (nginx or nginx-unprivileged image):
+#        COPY infra/security-headers.conf.template /etc/nginx/templates/security-headers.conf.template
+#        ENV NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx/snippets \
+#            NGINX_ENVSUBST_FILTER='^(KEYCLOAK_ORIGIN|DEN_ORIGIN|S3_ORIGIN|EXTRA_CONNECT_SRC)$' \
+#            KEYCLOAK_ORIGIN="" DEN_ORIGIN="" S3_ORIGIN="" EXTRA_CONNECT_SRC=""
+#      The image's entrypoint writes /etc/nginx/snippets/security-headers.conf
+#      at start-up; /etc/nginx/snippets must be writable (an emptyDir with a
+#      read-only root file system). Set the four variables in the Deployment
+#      or Compose service.
+#   3. include it in every location that serves the app, NOT at server level
+#      and NOT in the location that proxies /api/ (the backend sets stricter
+#      API headers itself; a server-level include would send two CSPs):
+#        location / {
+#            try_files $uri $uri/ /index.html;
+#            include /etc/nginx/snippets/security-headers.conf;
+#            add_header Cache-Control "no-cache" always;
+#        }
+#   4. script-src 'self' blocks inline <script> blocks: move them into files
+#      under public/, notably the theme script in index.html and the
+#      postMessage script in silent-callback.html.
+#   5. Stash only: camera=(self) in Permissions-Policy (barcode scanning);
+#      every other app keeps camera=().
+#   6. Check: curl -sI https://hr.con.example.org/ | grep -i -E 'content-security|x-frame|referrer|permissions|nosniff'
+#
+# Not here on purpose: Strict-Transport-Security (HSTS) is set once at the
+# Gateway or Caddy, which terminates TLS for every host.
+#
+# Desk: frame-src also allows about:srcdoc. Customer mail is shown in a
+# sandboxed iframe whose document is srcdoc; without about:srcdoc the
+# browser's frame-src check blocks that frame. BlockNote keeps working:
+# style-src already allows 'unsafe-inline', and its scripts are files.
+
+# Scripts, styles, fonts and images only from the app itself; data: and blob:
+# images for uploads and previews, and images from the S3 storage; API calls
+# to the app (same origin, the backend is proxied under /api), the sign-in
+# server, Den and the S3 storage. The app may not be framed by anyone, and
+# forms post only to itself or Keycloak.
+add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: ${S3_ORIGIN}; font-src 'self' data:; connect-src 'self' ${KEYCLOAK_ORIGIN} ${DEN_ORIGIN} ${S3_ORIGIN} ${EXTRA_CONNECT_SRC}; frame-src 'self' about:srcdoc ${KEYCLOAK_ORIGIN}; frame-ancestors 'none'; form-action 'self' ${KEYCLOAK_ORIGIN}; base-uri 'self'; object-src 'none'" always;
+
+# Older browsers that do not know frame-ancestors.
+add_header X-Frame-Options "DENY" always;
+
+# Never guess a content type from the bytes.
+add_header X-Content-Type-Options "nosniff" always;
+
+# Send only the origin to other sites, nothing over plain HTTP.
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+# Browser features. Stash's copy uses camera=(self); see step 5.
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()" always;
