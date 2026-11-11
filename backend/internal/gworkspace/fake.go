@@ -25,6 +25,8 @@ type Fake struct {
 	groups  map[string]*Group
 	members map[string]map[string]Member
 	mail    map[string][]*Message
+	labels  map[string]map[string]*Label
+	sendAs  map[string]map[string]SendAs
 	nextID  int
 }
 
@@ -36,6 +38,7 @@ func NewFake(domain string) *Fake {
 		Domain: strings.ToLower(domain),
 		users:  map[string]*User{}, groups: map[string]*Group{},
 		members: map[string]map[string]Member{}, mail: map[string][]*Message{},
+		labels: map[string]map[string]*Label{}, sendAs: map[string]map[string]SendAs{},
 	}
 }
 
@@ -363,4 +366,107 @@ func (f *Fake) ModifyLabels(_ context.Context, mailbox, id string, add, remove [
 
 func (f *Fake) TrashMessage(ctx context.Context, mailbox, id string) (*Message, error) {
 	return f.ModifyLabels(ctx, mailbox, id, []string{"TRASH"}, []string{"INBOX"})
+}
+
+// UntrashMessage removes TRASH and puts the message back in INBOX.
+func (f *Fake) UntrashMessage(ctx context.Context, mailbox, id string) (*Message, error) {
+	return f.ModifyLabels(ctx, mailbox, id, []string{"INBOX"}, []string{"TRASH"})
+}
+
+// ListLabels returns labels created with CreateLabel. The real API also
+// returns system labels such as INBOX; the fake does not invent those.
+func (f *Fake) ListLabels(_ context.Context, mailbox string) ([]Label, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.inDomain("mailbox", mailbox); err != nil {
+		return nil, err
+	}
+	var out []Label
+	for _, l := range f.labels[strings.ToLower(mailbox)] {
+		out = append(out, *l)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	if out == nil {
+		out = []Label{}
+	}
+	return out, nil
+}
+
+// CreateLabel stores a user label. A second create with the same name is
+// a conflict.
+func (f *Fake) CreateLabel(_ context.Context, mailbox, name string) (*Label, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, fmt.Errorf("google workspace: empty label name")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.inDomain("mailbox", mailbox); err != nil {
+		return nil, err
+	}
+	key := strings.ToLower(mailbox)
+	if f.labels[key] == nil {
+		f.labels[key] = map[string]*Label{}
+	}
+	if _, ok := f.labels[key][name]; ok {
+		return nil, conflict("label", name)
+	}
+	l := &Label{
+		ID: "Label_" + f.id(), Name: name, Type: "user",
+		MessageListVisibility: "show", LabelListVisibility: "labelShow",
+	}
+	f.labels[key][name] = l
+	cp := *l
+	return &cp, nil
+}
+
+// CreateSendAs records an alias mailbox may send as. The alias must be in
+// the domain. Creating it again is a conflict.
+func (f *Fake) CreateSendAs(_ context.Context, mailbox, alias, displayName string) (*SendAs, error) {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return nil, fmt.Errorf("google workspace: empty send-as address")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.inDomain("mailbox", mailbox); err != nil {
+		return nil, err
+	}
+	if err := f.inDomain("send-as", alias); err != nil {
+		return nil, err
+	}
+	key := strings.ToLower(mailbox)
+	norm := strings.ToLower(alias)
+	if f.sendAs[key] == nil {
+		f.sendAs[key] = map[string]SendAs{}
+	}
+	if _, ok := f.sendAs[key][norm]; ok {
+		return nil, conflict("send-as", alias)
+	}
+	s := SendAs{
+		SendAsEmail: alias, DisplayName: strings.TrimSpace(displayName),
+		TreatAsAlias: true, VerificationStatus: "accepted",
+	}
+	f.sendAs[key][norm] = s
+	return &s, nil
+}
+
+// DeleteSendAs removes an alias. A missing alias is not found.
+func (f *Fake) DeleteSendAs(_ context.Context, mailbox, alias string) error {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return fmt.Errorf("google workspace: empty send-as address")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.inDomain("mailbox", mailbox); err != nil {
+		return err
+	}
+	key := strings.ToLower(mailbox)
+	norm := strings.ToLower(alias)
+	if _, ok := f.sendAs[key][norm]; !ok {
+		return notFound("send-as", alias)
+	}
+	delete(f.sendAs[key], norm)
+	return nil
 }

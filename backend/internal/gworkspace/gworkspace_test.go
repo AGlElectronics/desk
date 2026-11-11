@@ -29,10 +29,10 @@ func testConfig() Config {
 
 func TestFromEnv(t *testing.T) {
 	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
-	if _, err := FromEnv(env(nil)); !errors.Is(err, ErrNotConfigured) {
+	if _, err := FromEnv(env(nil)); !errors.Is(err, ErrNotConfigured) || err.Error() != "google workspace is not configured" {
 		t.Errorf("empty: %v", err)
 	}
-	if _, err := FromEnv(env(map[string]string{EnvDomain: domain})); err == nil || !strings.Contains(err.Error(), EnvCredentialsFile) {
+	if _, err := FromEnv(env(map[string]string{EnvDomain: domain})); err == nil || !strings.HasPrefix(err.Error(), "google workspace needs") || !strings.Contains(err.Error(), EnvCredentialsFile) {
 		t.Errorf("partial: %v", err)
 	}
 	if _, err := FromEnv(env(map[string]string{EnvCredentialsFile: "/x.json", EnvAdminEmail: "admin@other.org", EnvDomain: domain})); err == nil {
@@ -375,5 +375,136 @@ func TestFake(t *testing.T) {
 	}
 	if len(f.Messages(mb)) != 2 {
 		t.Errorf("mailbox has %d messages", len(f.Messages(mb)))
+	}
+	if _, err := w.UntrashMessage(ctx, mb, in.ID); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = w.ListMessages(ctx, mb, ListQuery{})
+	back := false
+	for _, ref := range list.Messages {
+		back = back || ref.ID == in.ID
+	}
+	if !back {
+		t.Fatalf("untrash %+v", list)
+	}
+	if labels, err := w.ListLabels(ctx, mb); err != nil || len(labels) != 0 {
+		t.Fatalf("no labels yet: %+v %v", labels, err)
+	}
+	lab, err := w.CreateLabel(ctx, mb, "Desk")
+	if err != nil || lab.ID == "" || lab.Name != "Desk" || lab.LabelListVisibility != "labelShow" || lab.MessageListVisibility != "show" {
+		t.Fatalf("create label %+v %v", lab, err)
+	}
+	if _, err := w.CreateLabel(ctx, mb, "Desk"); !IsConflict(err) {
+		t.Errorf("duplicate label: %v", err)
+	}
+	if _, err := w.CreateLabel(ctx, mb, "  "); err == nil {
+		t.Error("empty label name accepted")
+	}
+	if labels, _ := w.ListLabels(ctx, mb); len(labels) != 1 || labels[0].ID != lab.ID {
+		t.Errorf("labels %+v", labels)
+	}
+	if _, err := w.CreateLabel(ctx, "someone@gmail.com", "Desk"); err == nil {
+		t.Error("label outside the domain created")
+	}
+	alias, err := w.CreateSendAs(ctx, mb, "info@con.example.org", "Info")
+	if err != nil || !alias.TreatAsAlias || alias.SendAsEmail != "info@con.example.org" || alias.DisplayName != "Info" {
+		t.Fatalf("send-as %+v %v", alias, err)
+	}
+	if _, err := w.CreateSendAs(ctx, mb, "Info@con.example.org", "Info"); !IsConflict(err) {
+		t.Errorf("duplicate send-as: %v", err)
+	}
+	if _, err := w.CreateSendAs(ctx, mb, "info@gmail.com", "Info"); err == nil {
+		t.Error("send-as outside the domain created")
+	}
+	if err := w.DeleteSendAs(ctx, mb, "info@con.example.org"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.DeleteSendAs(ctx, mb, "info@con.example.org"); !IsNotFound(err) {
+		t.Errorf("delete missing send-as: %v", err)
+	}
+}
+
+func TestGmailLabelsUntrashAndSendAs(t *testing.T) {
+	c, calls := fakeGoogle(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/gmail/v1/users/me/labels" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"labels":[{"id":"INBOX","name":"INBOX","type":"system"},{"id":"Label_1","name":"Desk","type":"user"}]}`))
+		case r.URL.Path == "/gmail/v1/users/me/labels" && r.Method == http.MethodPost:
+			_, _ = w.Write([]byte(`{"id":"Label_2","name":"Desk/Unrouted","type":"user","labelListVisibility":"labelShow","messageListVisibility":"show"}`))
+		case strings.HasSuffix(r.URL.Path, "/untrash"):
+			_, _ = w.Write([]byte(`{"id":"a","threadId":"t","labelIds":["INBOX"]}`))
+		case r.URL.Path == "/gmail/v1/users/me/settings/sendAs" && r.Method == http.MethodPost:
+			raw, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(raw), "taken@") {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"error":{"code":409,"message":"already exists","errors":[{"reason":"duplicate"}]}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"sendAsEmail":"info@con.example.org","displayName":"Info","treatAsAlias":true,"verificationStatus":"accepted"}`))
+		case r.Method == http.MethodDelete && strings.HasSuffix(r.URL.Path, "/info@con.example.org"):
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":404,"message":"not found","errors":[{"reason":"notFound"}]}}`))
+		}
+	})
+	ctx := context.Background()
+	mb := "desk@con.example.org"
+
+	labels, err := c.ListLabels(ctx, mb)
+	if err != nil || len(labels) != 2 || labels[1].ID != "Label_1" || labels[1].Name != "Desk" {
+		t.Fatalf("ListLabels %+v %v", labels, err)
+	}
+	created, err := c.CreateLabel(ctx, mb, " Desk/Unrouted ")
+	if err != nil || created.ID != "Label_2" || created.Name != "Desk/Unrouted" {
+		t.Fatalf("CreateLabel %+v %v", created, err)
+	}
+	if _, err := c.CreateLabel(ctx, mb, " "); err == nil {
+		t.Error("empty label name sent")
+	}
+	m, err := c.UntrashMessage(ctx, mb, "a")
+	if err != nil || m.ID != "a" || len(m.LabelIDs) != 1 || m.LabelIDs[0] != "INBOX" {
+		t.Fatalf("Untrash %+v %v", m, err)
+	}
+	alias, err := c.CreateSendAs(ctx, mb, " info@con.example.org ", " Info ")
+	if err != nil || alias.SendAsEmail != "info@con.example.org" || !alias.TreatAsAlias || alias.DisplayName != "Info" || alias.VerificationStatus != "accepted" {
+		t.Fatalf("CreateSendAs %+v %v", alias, err)
+	}
+	if err := c.DeleteSendAs(ctx, mb, "info@con.example.org"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CreateSendAs(ctx, mb, "taken@con.example.org", "Taken"); !IsConflict(err) {
+		t.Errorf("conflict: %v", err)
+	}
+	if err := c.DeleteSendAs(ctx, mb, "missing@con.example.org"); !IsNotFound(err) {
+		t.Errorf("missing send-as: %v", err)
+	}
+	if _, err := c.ListLabels(ctx, "someone@gmail.com"); err == nil {
+		t.Error("mailbox outside the domain used")
+	}
+	if _, err := c.CreateSendAs(ctx, mb, "out@gmail.com", "Out"); err == nil {
+		t.Error("send-as outside the domain sent")
+	}
+	if err := c.DeleteSendAs(ctx, mb, " "); err == nil {
+		t.Error("empty send-as address sent")
+	}
+
+	want := []call{
+		{method: "GET", path: "/gmail/v1/users/me/labels", scopes: GmailScopes[0]},
+		{method: "POST", path: "/gmail/v1/users/me/labels", body: `{"name":"Desk/Unrouted","messageListVisibility":"show","labelListVisibility":"labelShow"}`, scopes: GmailScopes[0]},
+		{method: "POST", path: "/gmail/v1/users/me/messages/a/untrash", scopes: GmailScopes[0]},
+		{method: "POST", path: "/gmail/v1/users/me/settings/sendAs", body: `{"sendAsEmail":"info@con.example.org","displayName":"Info","treatAsAlias":true}`, scopes: strings.Join(SendAsScopes(), " ")},
+		{method: "DELETE", path: "/gmail/v1/users/me/settings/sendAs/info@con.example.org", scopes: strings.Join(SendAsScopes(), " ")},
+		{method: "POST", path: "/gmail/v1/users/me/settings/sendAs", body: `{"sendAsEmail":"taken@con.example.org","displayName":"Taken","treatAsAlias":true}`, scopes: strings.Join(SendAsScopes(), " ")},
+		{method: "DELETE", path: "/gmail/v1/users/me/settings/sendAs/missing@con.example.org", scopes: strings.Join(SendAsScopes(), " ")},
+	}
+	if len(*calls) != len(want) {
+		t.Fatalf("%d calls, want %d: %+v", len(*calls), len(want), *calls)
+	}
+	for i, w := range want {
+		got := (*calls)[i]
+		if got.method != w.method || got.path != w.path || (w.body != "" && got.body != w.body) || got.scopes != w.scopes || got.subject != mb {
+			t.Errorf("call %d = %+v, want %+v", i, got, w)
+		}
 	}
 }

@@ -2,10 +2,10 @@
 
 // Package gworkspace is a small Google Workspace client for Con Services
 // modules: Admin SDK Directory (users, groups, group members) and the Gmail
-// API (list, read, send, label, trash). It signs in as a service account
-// with domain-wide delegation and impersonates a person: the admin in
-// GOOGLE_WORKSPACE_ADMIN_EMAIL for Directory calls, the mailbox owner for
-// Gmail calls.
+// API (list, read, send, labels, trash, untrash, send-as aliases). It signs
+// in as a service account with domain-wide delegation and impersonates a
+// person: the admin in GOOGLE_WORKSPACE_ADMIN_EMAIL for Directory calls, the
+// mailbox owner for Gmail calls.
 //
 // Modules depend on the Directory and Gmail interfaces and use Fake in
 // tests.
@@ -42,6 +42,21 @@ var (
 	GmailScopes = []string{"https://www.googleapis.com/auth/gmail.modify"}
 )
 
+// SendAsScope is the extra OAuth scope CreateSendAs and DeleteSendAs
+// request on top of GmailScopes. Authorise it in domain-wide delegation
+// only when a module creates send-as aliases (Desk). Other Gmail calls
+// stay on GmailScopes, so a module that never creates an alias does not
+// have to authorise this scope.
+const SendAsScope = "https://www.googleapis.com/auth/gmail.settings.sharing"
+
+// SendAsScopes is GmailScopes plus SendAsScope. The result is a new slice.
+func SendAsScopes() []string {
+	out := make([]string, len(GmailScopes)+1)
+	copy(out, GmailScopes)
+	out[len(GmailScopes)] = SendAsScope
+	return out
+}
+
 // Default API endpoints.
 const (
 	DefaultDirectoryURL = "https://admin.googleapis.com/admin/directory/v1"
@@ -50,7 +65,7 @@ const (
 
 // ErrNotConfigured is returned by FromEnv when none of the variables is set:
 // the module runs without Google Workspace.
-var ErrNotConfigured = errors.New("Google Workspace is not configured")
+var ErrNotConfigured = errors.New("google workspace is not configured")
 
 // Config is the connection to one Workspace domain.
 type Config struct {
@@ -92,7 +107,7 @@ func (c Config) Validate() error {
 		missing = append(missing, EnvDomain)
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("Google Workspace needs %s", strings.Join(missing, ", "))
+		return fmt.Errorf("google workspace needs %s", strings.Join(missing, ", "))
 	}
 	if !c.InDomain(c.AdminEmail) {
 		return fmt.Errorf("%s %q is not in %s %q", EnvAdminEmail, c.AdminEmail, EnvDomain, c.Domain)
@@ -142,6 +157,11 @@ type Gmail interface {
 	SendMessage(ctx context.Context, mailbox string, raw []byte, threadID string) (*Message, error)
 	ModifyLabels(ctx context.Context, mailbox, id string, add, remove []string) (*Message, error)
 	TrashMessage(ctx context.Context, mailbox, id string) (*Message, error)
+	UntrashMessage(ctx context.Context, mailbox, id string) (*Message, error)
+	ListLabels(ctx context.Context, mailbox string) ([]Label, error)
+	CreateLabel(ctx context.Context, mailbox, name string) (*Label, error)
+	CreateSendAs(ctx context.Context, mailbox, alias, displayName string) (*SendAs, error)
+	DeleteSendAs(ctx context.Context, mailbox, alias string) error
 }
 
 // Workspace is both.

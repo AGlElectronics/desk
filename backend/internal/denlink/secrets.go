@@ -77,6 +77,9 @@ func normalizeSecretKey(key string) (string, error) {
 	return key, nil
 }
 
+// clearSecretCache drops Den answers that are not the bundle: the secrets
+// document and the paired-module list. A successful sync, pairing again,
+// unpairing, or a rejected credential calls it.
 func (c *Client) clearSecretCache() {
 	if c == nil {
 		return
@@ -86,6 +89,7 @@ func (c *Client) clearSecretCache() {
 	c.secretAt = time.Time{}
 	c.secretEpoch++
 	c.secretsMu.Unlock()
+	c.clearModulesCache()
 }
 
 // secretsDocument returns the cached secrets JSON, or fetches it. The

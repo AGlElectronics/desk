@@ -183,3 +183,98 @@ func nonNil(s []string) []string {
 	}
 	return s
 }
+
+// Label is a Gmail label (users.labels). System labels such as INBOX have
+// Type "system"; labels this client creates have Type "user".
+type Label struct {
+	ID                    string `json:"id,omitempty"`
+	Name                  string `json:"name"`
+	Type                  string `json:"type,omitempty"`
+	MessageListVisibility string `json:"messageListVisibility,omitempty"`
+	LabelListVisibility   string `json:"labelListVisibility,omitempty"`
+}
+
+// ListLabels returns the mailbox's labels, system and user.
+func (c *Client) ListLabels(ctx context.Context, mailbox string) ([]Label, error) {
+	var out struct {
+		Labels []Label `json:"labels"`
+	}
+	if err := c.gmail(ctx, mailbox, http.MethodGet, "/labels", nil, nil, &out); err != nil {
+		return nil, err
+	}
+	if out.Labels == nil {
+		out.Labels = []Label{}
+	}
+	return out.Labels, nil
+}
+
+// CreateLabel creates a user label called name. The label is shown in the
+// label list and on messages (labelShow / show), which is what Desk asks
+// Google for. An existing name comes back as a conflict (IsConflict).
+func (c *Client) CreateLabel(ctx context.Context, mailbox, name string) (*Label, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, fmt.Errorf("google workspace: empty label name")
+	}
+	body := Label{Name: name, LabelListVisibility: "labelShow", MessageListVisibility: "show"}
+	var out Label
+	if err := c.gmail(ctx, mailbox, http.MethodPost, "/labels", nil, &body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// UntrashMessage moves a message out of the trash.
+func (c *Client) UntrashMessage(ctx context.Context, mailbox, id string) (*Message, error) {
+	var m Message
+	if err := c.gmail(ctx, mailbox, http.MethodPost, "/messages/"+esc(id)+"/untrash", nil, nil, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// SendAs is a Gmail send-as alias (users.settings.sendAs).
+type SendAs struct {
+	SendAsEmail        string `json:"sendAsEmail"`
+	DisplayName        string `json:"displayName,omitempty"`
+	TreatAsAlias       bool   `json:"treatAsAlias"`
+	IsPrimary          bool   `json:"isPrimary,omitempty"`
+	VerificationStatus string `json:"verificationStatus,omitempty"`
+}
+
+// CreateSendAs adds alias as an address mailbox may send as, with the
+// display name shown to recipients. TreatAsAlias is always true (a group
+// mailbox's address on the shared account, which is how Desk uses it).
+// The alias must be in the Workspace domain. An alias that already exists
+// is a conflict (IsConflict). This call requests SendAsScopes.
+func (c *Client) CreateSendAs(ctx context.Context, mailbox, alias, displayName string) (*SendAs, error) {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return nil, fmt.Errorf("google workspace: empty send-as address")
+	}
+	if err := c.checkDomain("send-as", alias); err != nil {
+		return nil, err
+	}
+	body := &SendAs{SendAsEmail: alias, DisplayName: strings.TrimSpace(displayName), TreatAsAlias: true}
+	var out SendAs
+	if err := c.gmailWith(ctx, mailbox, SendAsScopes(), http.MethodPost, "/settings/sendAs", nil, body, &out); err != nil {
+		return nil, err
+	}
+	if out.SendAsEmail == "" {
+		out = *body
+	}
+	return &out, nil
+}
+
+// DeleteSendAs removes a send-as alias from mailbox. A missing alias is
+// not found (IsNotFound). This call requests SendAsScopes.
+func (c *Client) DeleteSendAs(ctx context.Context, mailbox, alias string) error {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return fmt.Errorf("google workspace: empty send-as address")
+	}
+	if err := c.checkDomain("send-as", alias); err != nil {
+		return err
+	}
+	return c.gmailWith(ctx, mailbox, SendAsScopes(), http.MethodDelete, "/settings/sendAs/"+esc(alias), nil, nil, nil)
+}

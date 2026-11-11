@@ -18,8 +18,9 @@
 // admin pairs again; it is never re-paired automatically.
 //
 // ModuleSettingSecret fetches values Den keeps out of the bundle (the
-// SMTP password). RequireDen checks a call Den makes into the module,
-// such as GET /api/portal/todos.
+// SMTP password). Modules lists Den's paired modules, including each
+// one's role catalog URL. RequireDen checks a call Den makes into the
+// module, such as GET /api/portal/todos.
 package denlink
 
 import (
@@ -275,6 +276,15 @@ type Client struct {
 	secretRaw   []byte
 	secretAt    time.Time
 	secretEpoch uint64
+
+	// modulesMu guards the cached paired-module list. It is not mu and
+	// not secretsMu: fetching the list does HTTP, and markRevoked
+	// (called from that HTTP) clears the copy.
+	modulesMu    sync.Mutex
+	modules      []Module
+	modulesAt    time.Time
+	modulesOK    bool
+	modulesEpoch uint64
 }
 
 // New returns a Client; call Run to start syncing. An invalid cfg (see

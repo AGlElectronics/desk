@@ -102,6 +102,10 @@ func (c *Client) dir(ctx context.Context, method, path string, q url.Values, in,
 }
 
 func (c *Client) gmail(ctx context.Context, mailbox, method, path string, q url.Values, in, out any) error {
+	return c.gmailWith(ctx, mailbox, GmailScopes, method, path, q, in, out)
+}
+
+func (c *Client) gmailWith(ctx context.Context, mailbox string, scopes []string, method, path string, q url.Values, in, out any) error {
 	if err := c.checkDomain("mailbox", mailbox); err != nil {
 		return err
 	}
@@ -109,7 +113,7 @@ func (c *Client) gmail(ctx context.Context, mailbox, method, path string, q url.
 	if len(q) > 0 {
 		u += "?" + q.Encode()
 	}
-	return c.do(ctx, mailbox, GmailScopes, method, u, in, out)
+	return c.do(ctx, mailbox, scopes, method, u, in, out)
 }
 
 func esc(s string) string { return url.PathEscape(s) }
