@@ -194,6 +194,8 @@ func (h *deskHandler) createConversation(w http.ResponseWriter, r *http.Request)
 		CustomerName  string    `json:"customer_name"`
 		Subject       string    `json:"subject"`
 		Body          string    `json:"body"`
+		BodyHTML      string    `json:"body_html"`
+		CC            []string  `json:"cc"`
 	}
 	if err := decodeJSON(r, &in); err != nil {
 		httperror.Render(w, r, err)
@@ -201,7 +203,7 @@ func (h *deskHandler) createConversation(w http.ResponseWriter, r *http.Request)
 	}
 	c, err := h.svc.CreateConversation(r.Context(), person(u), desk.NewConversationInput{
 		MailboxID: in.MailboxID, CustomerEmail: in.CustomerEmail, CustomerName: in.CustomerName,
-		Subject: in.Subject, Body: in.Body,
+		Subject: in.Subject, Body: in.Body, BodyHTML: in.BodyHTML, CC: in.CC,
 	})
 	if err != nil {
 		httperror.Render(w, r, err)
@@ -284,15 +286,19 @@ func (h *deskHandler) addThread(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Kind   string  `json:"kind"`
-		Body   string  `json:"body"`
-		Status *string `json:"status"`
+		Kind     string    `json:"kind"`
+		Body     string    `json:"body"`
+		BodyHTML string    `json:"body_html"`
+		CC       *[]string `json:"cc"`
+		Status   *string   `json:"status"`
 	}
 	if err := decodeJSON(r, &in); err != nil {
 		httperror.Render(w, r, err)
 		return
 	}
-	id, err := h.svc.AddThread(r.Context(), c, person(u), desk.ThreadInput{Kind: in.Kind, Body: in.Body, Status: in.Status})
+	id, err := h.svc.AddThread(r.Context(), c, person(u), desk.ThreadInput{
+		Kind: in.Kind, Body: in.Body, BodyHTML: in.BodyHTML, CC: in.CC, Status: in.Status,
+	})
 	if err != nil {
 		httperror.Render(w, r, err)
 		return

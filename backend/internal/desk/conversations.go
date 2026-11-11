@@ -7,6 +7,7 @@ import (
 	"html"
 	"io"
 	"net/mail"
+	"regexp"
 	"strings"
 	"time"
 
@@ -354,84 +355,191 @@ func systemLine(ctx context.Context, tx pgx.Tx, convID, actorID uuid.UUID, text 
 // ThreadInput is a reply or a note written by an agent.
 type ThreadInput struct {
 	Kind string // reply | note
-	Body string
+	// Body is the plain text; BodyHTML the rich text from the editor. At
+	// least one is required; a missing plain text is derived from the HTML.
+	Body     string
+	BodyHTML string
+	// CC for a reply. nil: everyone the customer's last message went to,
+	// except Desk's own mailboxes and the customer.
+	CC *[]string
 	// Status after a reply (default pending: waiting on the customer).
 	Status *string
 }
 
+// composeBodies returns sanitised HTML and plain text for an agent's
+// message.
+func composeBodies(text, rich string) (string, string) {
+	text = strings.TrimSpace(clean(text))
+	rich = strings.TrimSpace(clean(rich))
+	if rich == "" {
+		return textToHTML(text), text
+	}
+	safe := htmlPolicy.Sanitize(rich)
+	if text == "" {
+		text = htmlToText(safe)
+	}
+	return safe, text
+}
+
+var (
+	blockEnd   = regexp.MustCompile(`(?i)</(p|div|h[1-6]|li|blockquote|tr|pre)>|<br\s*/?>`)
+	listItem   = regexp.MustCompile(`(?i)<li[^>]*>`)
+	manyBlanks = regexp.MustCompile(`\n{3,}`)
+)
+
+// htmlToText is the plain-text alternative of an HTML message.
+func htmlToText(h string) string {
+	h = blockEnd.ReplaceAllString(h, "$0\n")
+	h = listItem.ReplaceAllString(h, "$0- ")
+	t := html.UnescapeString(stripPolicy.Sanitize(h))
+	lines := strings.Split(t, "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimRight(l, " \t")
+	}
+	return strings.TrimSpace(manyBlanks.ReplaceAllString(strings.Join(lines, "\n"), "\n\n"))
+}
+
 // AddThread stores a reply (queued for sending) or an internal note.
 func (s *Service) AddThread(ctx context.Context, c Conversation, author *Person, in ThreadInput) (uuid.UUID, error) {
-	body := strings.TrimSpace(in.Body)
-	if body == "" {
-		return uuid.Nil, httperror.Validation("empty message", map[string]string{"body": "required"})
-	}
-	if in.Kind != domain.ThreadReply && in.Kind != domain.ThreadNote {
-		return uuid.Nil, httperror.BadRequest("kind must be reply or note")
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return uuid.Nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-
-	threadID := uuid.New()
-	if in.Kind == domain.ThreadNote {
-		_, err = tx.Exec(ctx, `
-			INSERT INTO threads (id, conversation_id, kind, author_id, body_text, body_html)
-			VALUES ($1, $2, 'note', $3, $4, $5)`, threadID, c.ID, author.ID, body, textToHTML(body))
-		if err != nil {
-			return uuid.Nil, err
-		}
-	} else {
-		mb, err := s.GetMailbox(ctx, c.MailboxID)
-		if err != nil {
-			return uuid.Nil, err
-		}
-		full := body
-		if sig := strings.TrimSpace(strings.ReplaceAll(mb.Signature, "{agent.name}", author.DisplayName)); sig != "" {
-			full += "\n\n" + sig
-		}
-		msgID := fmt.Sprintf("desk.%s@%s", threadID, domainOf(mb.Email))
-		_, err = tx.Exec(ctx, `
-			INSERT INTO threads (id, conversation_id, kind, author_id, from_email, to_emails, body_text, body_html,
-			                     message_id, send_status, next_attempt_at)
-			VALUES ($1, $2, 'reply', $3, $4, $5, $6, $7, $8, 'queued', now() + $9::interval)`,
-			threadID, c.ID, author.ID, mb.Email, []string{c.Customer.Email}, full, textToHTML(full),
-			msgID, fmt.Sprintf("%d seconds", int(undoWindow.Seconds())))
-		if err != nil {
-			return uuid.Nil, err
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO message_ids (message_id, conversation_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, msgID, c.ID); err != nil {
-			return uuid.Nil, err
-		}
-		status := domain.StatusPending
-		if in.Status != nil {
-			status = *in.Status
-		}
-		upd := UpdateInput{Status: &status}
-		if c.AssigneeID == nil {
-			// Answering an unassigned conversation takes it, as in FreeScout.
-			upd.AssigneeID = &author.ID
-		}
-		if err := s.applyUpdate(ctx, tx, c, author.ID, upd); err != nil {
-			return uuid.Nil, err
-		}
-	}
-	if in.Kind == domain.ThreadReply {
-		_, err = tx.Exec(ctx, `UPDATE conversations SET last_activity_at = now(), preview = $2 WHERE id = $1`, c.ID, previewOf(body))
-	} else {
-		_, err = tx.Exec(ctx, `UPDATE conversations SET last_activity_at = now() WHERE id = $1`, c.ID)
-	}
+	id, err := s.addThreadTx(ctx, tx, c, author, in)
 	if err != nil {
 		return uuid.Nil, err
 	}
-	return threadID, tx.Commit(ctx)
+	return id, tx.Commit(ctx)
+}
+
+func (s *Service) addThreadTx(ctx context.Context, tx pgx.Tx, c Conversation, author *Person, in ThreadInput) (uuid.UUID, error) {
+	if in.Kind != domain.ThreadReply && in.Kind != domain.ThreadNote {
+		return uuid.Nil, httperror.BadRequest("kind must be reply or note")
+	}
+	htmlBody, text := composeBodies(in.Body, in.BodyHTML)
+	if text == "" {
+		return uuid.Nil, httperror.Validation("empty message", map[string]string{"body": "required"})
+	}
+
+	threadID := uuid.New()
+	if in.Kind == domain.ThreadNote {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO threads (id, conversation_id, kind, author_id, body_text, body_html)
+			VALUES ($1, $2, 'note', $3, $4, $5)`, threadID, c.ID, author.ID, text, htmlBody); err != nil {
+			return uuid.Nil, err
+		}
+		_, err := tx.Exec(ctx, `UPDATE conversations SET last_activity_at = now() WHERE id = $1`, c.ID)
+		return threadID, err
+	}
+
+	mb, err := s.GetMailbox(ctx, c.MailboxID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	var cc []string
+	if in.CC != nil {
+		cc, err = cleanAddresses(*in.CC, "cc")
+		if err != nil {
+			return uuid.Nil, err
+		}
+	} else if cc, err = defaultCC(ctx, tx, c); err != nil {
+		return uuid.Nil, err
+	}
+	if sig := strings.TrimSpace(strings.ReplaceAll(mb.Signature, "{agent.name}", author.DisplayName)); sig != "" {
+		text += "\n\n" + sig
+		htmlBody += "<br><br>" + textToHTML(sig)
+	}
+	msgID := fmt.Sprintf("desk.%s@%s", threadID, domainOf(mb.Email))
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO threads (id, conversation_id, kind, author_id, from_email, to_emails, cc_emails, body_text, body_html,
+		                     message_id, send_status, next_attempt_at)
+		VALUES ($1, $2, 'reply', $3, $4, $5, $6, $7, $8, $9, 'queued', now() + $10::interval)`,
+		threadID, c.ID, author.ID, mb.Email, []string{c.Customer.Email}, cc, text, htmlBody,
+		msgID, fmt.Sprintf("%d seconds", int(undoWindow.Seconds()))); err != nil {
+		return uuid.Nil, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO message_ids (message_id, conversation_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, msgID, c.ID); err != nil {
+		return uuid.Nil, err
+	}
+	status := domain.StatusPending
+	if in.Status != nil {
+		status = *in.Status
+	}
+	upd := UpdateInput{Status: &status}
+	if c.AssigneeID == nil {
+		// Answering an unassigned conversation takes it, as in FreeScout.
+		upd.AssigneeID = &author.ID
+	}
+	if err := s.applyUpdate(ctx, tx, c, author.ID, upd); err != nil {
+		return uuid.Nil, err
+	}
+	_, err = tx.Exec(ctx, `UPDATE conversations SET last_activity_at = now(), preview = $2 WHERE id = $1`, c.ID, previewOf(text))
+	return threadID, err
+}
+
+// cleanAddresses validates a list of plain addresses.
+func cleanAddresses(list []string, field string) ([]string, error) {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, raw := range list {
+		a, err := mail.ParseAddress(strings.TrimSpace(raw))
+		if err != nil {
+			return nil, httperror.Validation("invalid address", map[string]string{field: raw + " is not an email address"})
+		}
+		addr := strings.ToLower(a.Address)
+		if !seen[addr] {
+			seen[addr] = true
+			out = append(out, addr)
+		}
+	}
+	if len(out) > 20 {
+		return nil, httperror.Validation("too many recipients", map[string]string{field: "at most 20 addresses"})
+	}
+	return out, nil
+}
+
+// defaultCC is "reply all": the To and Cc of the customer's latest message
+// without Desk's own mailboxes and the customer themself.
+func defaultCC(ctx context.Context, tx pgx.Tx, c Conversation) ([]string, error) {
+	var to, cc []string
+	err := tx.QueryRow(ctx, `
+		SELECT to_emails, cc_emails FROM threads
+		 WHERE conversation_id = $1 AND kind = 'customer' AND NOT auto_submitted
+		 ORDER BY created_at DESC LIMIT 1`, c.ID).Scan(&to, &cc)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, `SELECT lower(email::text) FROM mailboxes`)
+	if err != nil {
+		return nil, err
+	}
+	own := map[string]bool{strings.ToLower(c.Customer.Email): true}
+	for rows.Next() {
+		var e string
+		if rows.Scan(&e) == nil {
+			own[e] = true
+		}
+	}
+	rows.Close()
+	out := []string{}
+	for _, a := range append(to, cc...) {
+		a = strings.ToLower(a)
+		if !own[a] {
+			own[a] = true
+			out = append(out, a)
+		}
+	}
+	return out, nil
 }
 
 // UndoReply deletes a reply that has not been sent yet.
 func (s *Service) UndoReply(ctx context.Context, threadID uuid.UUID) error {
 	tag, err := s.pool.Exec(ctx, `
-		DELETE FROM threads WHERE id = $1 AND kind = 'reply' AND send_status = 'queued' AND send_attempts = 0
+		DELETE FROM threads WHERE id = $1 AND kind IN ('reply', 'forward') AND send_status = 'queued' AND send_attempts = 0
 		   AND next_attempt_at > now()`, threadID)
 	if err != nil {
 		return err
@@ -447,7 +555,7 @@ func (s *Service) UndoReply(ctx context.Context, threadID uuid.UUID) error {
 func (s *Service) RetryReply(ctx context.Context, threadID uuid.UUID) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE threads SET send_status = 'queued', send_attempts = 0, send_error = '', next_attempt_at = now()
-		 WHERE id = $1 AND kind = 'reply' AND send_status = 'failed'`, threadID)
+		 WHERE id = $1 AND kind IN ('reply', 'forward', 'auto_reply') AND send_status = 'failed'`, threadID)
 	if err != nil {
 		return err
 	}
@@ -477,9 +585,12 @@ type NewConversationInput struct {
 	CustomerName  string
 	Subject       string
 	Body          string
+	BodyHTML      string
+	CC            []string
 }
 
-// CreateConversation opens a conversation and queues its first reply.
+// CreateConversation opens a conversation and queues its first reply, in
+// one transaction: a failure leaves nothing behind.
 func (s *Service) CreateConversation(ctx context.Context, author *Person, in NewConversationInput) (Conversation, error) {
 	addr, err := mail.ParseAddress(strings.TrimSpace(in.CustomerEmail))
 	issues := map[string]string{}
@@ -489,7 +600,7 @@ func (s *Service) CreateConversation(ctx context.Context, author *Person, in New
 	if strings.TrimSpace(in.Subject) == "" {
 		issues["subject"] = "required"
 	}
-	if strings.TrimSpace(in.Body) == "" {
+	if _, text := composeBodies(in.Body, in.BodyHTML); text == "" {
 		issues["body"] = "required"
 	}
 	if len(issues) > 0 {
@@ -512,18 +623,22 @@ func (s *Service) CreateConversation(ctx context.Context, author *Person, in New
 	if err != nil {
 		return Conversation{}, err
 	}
-	convID, err := insertConversation(ctx, tx, mb.ID, customerID, strings.TrimSpace(in.Subject), domain.StatusActive)
+	convID, err := insertConversation(ctx, tx, mb.ID, customerID, clean(strings.TrimSpace(in.Subject)), domain.StatusActive)
 	if err != nil {
+		return Conversation{}, err
+	}
+	c, err := scanConversation(tx.QueryRow(ctx, convSelect+" WHERE c.id = $1", convID))
+	if err != nil {
+		return Conversation{}, err
+	}
+	cc := in.CC
+	if cc == nil {
+		cc = []string{}
+	}
+	if _, err := s.addThreadTx(ctx, tx, c, author, ThreadInput{Kind: domain.ThreadReply, Body: in.Body, BodyHTML: in.BodyHTML, CC: &cc}); err != nil {
 		return Conversation{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Conversation{}, err
-	}
-	c, err := s.GetConversation(ctx, convID)
-	if err != nil {
-		return Conversation{}, err
-	}
-	if _, err := s.AddThread(ctx, c, author, ThreadInput{Kind: domain.ThreadReply, Body: in.Body}); err != nil {
 		return Conversation{}, err
 	}
 	return s.GetConversation(ctx, convID)
