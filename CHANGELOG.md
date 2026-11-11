@@ -23,7 +23,7 @@ counts rebuilds of the same version. Rebuilds get no entry here.
 - Den link uses the shared client: `DEN_LINK_ENCRYPTION_KEY` (and `_PREVIOUS` while rotating) encrypts the stored credential, and `den_link.revoked_at` records a rejected credential. The Den connection card then says to pair again. SMTP and retention come from Den's module settings (`smtp.*`, `desk.retention.*`); when Den holds the SMTP password, Desk fetches it when sending and does not store it.
 - Per-mailbox roles are matched with `OIDC_GROUP_MATCH`, `OIDC_GROUP_PREFIX` and only the claim `OIDC_GROUPS_CLAIM`. Sign-in stores each group normalised and as the token sent it.
 - JSON bodies are limited to 1 MiB. New conversations, replies, forwards, mailbox signatures and saved replies may be up to 20 MiB. Oversized bodies answer `413 request_too_large`.
-- The web app's nginx sends the shared security headers only on the pages it serves, not on `/api/`. Inline scripts moved to `theme-init.js` and `silent-callback.js`. Customer mail stays in a sandboxed frame (`about:srcdoc` is allowed in the page policy).
+- The web app's nginx sends the shared security headers only on the pages it serves, not on `/api/`. Inline scripts moved to `theme-init.js` and `silent-callback.js`. `/silent-callback.html` is the one page the app may frame (silent sign-in). Customer mail stays in a sandboxed frame: set `EXTRA_FRAME_SRC=about:srcdoc` on the frontend (the image, Compose and the chart do).
 
 - Shared-inbox helpdesk: each support address is a mailbox, and every email
   thread becomes a conversation that staff assign, answer, annotate and
@@ -136,6 +136,12 @@ counts rebuilds of the same version. Rebuilds get no entry here.
 
 ### Changed
 
+- **Action required:** in the Google Admin console, open **Security → Access and data control → API controls → Domain-wide delegation**, edit the Desk service account's client ID, and add this scope (leave the scopes already there):
+
+  `https://www.googleapis.com/auth/gmail.settings.sharing`
+
+  Desk uses it only to add and remove the send-as address of a group mailbox on the shared account. `gmail.modify` does not cover that. Without this scope those calls are rejected and a group mailbox cannot be created or suspended. Changes can take a few minutes.
+- Gmail labels, restoring mail from trash, and send-as aliases now go through the shared Google client. A send-as address that already exists, and one that is already gone, still count as success.
 - **BREAKING (pre-release builds only):** the roles `desk-agent`
   (`agent`, permission `tickets.work`) are gone. Add people to the groups
   `desk-<slug>-viewer`, `desk-<slug>-manager` or `desk-<slug>-delete` of

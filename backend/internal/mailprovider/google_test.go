@@ -11,18 +11,23 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/AGlElectronics/desk/backend/internal/gworkspace"
 )
 
 // fakeGoogle is the subset of the Directory and Gmail REST APIs Desk calls.
 // The test server never contacts Google.
 type fakeGoogle struct {
-	mu       sync.Mutex
-	users    map[string]bool
-	groups   map[string][]string
-	aliases  []string
-	labels   map[string]string
-	messages []string // ids, newest first, as Google lists them
-	labelSeq int
+	mu         sync.Mutex
+	users      map[string]bool
+	groups     map[string][]string
+	aliases    []string
+	labels     map[string]string
+	messages   []string // ids, newest first, as Google lists them
+	labelSeq   int
+	denySendAs bool
+	// scopes records "subject\tscope scope" from each new authorised client.
+	scopes []string
 }
 
 func (f *fakeGoogle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -99,11 +104,18 @@ func (f *fakeGoogle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if _, ok := f.groups[group]; !ok {
+		members, ok := f.groups[group]
+		if !ok {
 			writeAPI(w, http.StatusNotFound, "not found")
 			return
 		}
-		f.groups[group] = append(f.groups[group], body.Email)
+		for _, m := range members {
+			if m == body.Email {
+				writeAPI(w, http.StatusConflict, "already exists")
+				return
+			}
+		}
+		f.groups[group] = append(members, body.Email)
 		writeJSON(w, map[string]string{"email": body.Email})
 	case r.Method == http.MethodDelete && strings.Contains(path, "/members/"):
 		w.WriteHeader(http.StatusNoContent)
@@ -129,19 +141,40 @@ func (f *fakeGoogle) gmail(w http.ResponseWriter, r *http.Request, path string) 
 	case r.Method == http.MethodPost && path == "/settings/sendAs":
 		var body struct {
 			SendAsEmail  string `json:"sendAsEmail"`
+			DisplayName  string `json:"displayName"`
 			TreatAsAlias bool   `json:"treatAsAlias"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		if !body.TreatAsAlias || body.SendAsEmail == "" {
+		if !body.TreatAsAlias || body.SendAsEmail == "" || body.DisplayName == "" {
 			writeAPI(w, http.StatusBadRequest, "send-as")
 			return
 		}
 		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.denySendAs {
+			writeAPI(w, http.StatusForbidden, "insufficient permissions")
+			return
+		}
+		for _, a := range f.aliases {
+			if a == body.SendAsEmail {
+				writeAPI(w, http.StatusConflict, "already exists")
+				return
+			}
+		}
 		f.aliases = append(f.aliases, body.SendAsEmail)
-		f.mu.Unlock()
-		writeJSON(w, map[string]string{"sendAsEmail": body.SendAsEmail})
+		writeJSON(w, map[string]string{"sendAsEmail": body.SendAsEmail, "displayName": body.DisplayName})
 	case r.Method == http.MethodDelete && strings.HasPrefix(path, "/settings/sendAs/"):
-		w.WriteHeader(http.StatusNoContent)
+		alias := unescape(strings.TrimPrefix(path, "/settings/sendAs/"))
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		for i, a := range f.aliases {
+			if a == alias {
+				f.aliases = append(f.aliases[:i], f.aliases[i+1:]...)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		writeAPI(w, http.StatusNotFound, "not found")
 	case r.Method == http.MethodGet && path == "/messages":
 		q := r.URL.Query().Get("q")
 		if q != "in:inbox -label:Desk" {
@@ -169,9 +202,15 @@ func (f *fakeGoogle) gmail(w http.ResponseWriter, r *http.Request, path string) 
 		writeJSON(w, map[string]any{"labels": labels})
 	case r.Method == http.MethodPost && path == "/labels":
 		var body struct {
-			Name string `json:"name"`
+			Name                  string `json:"name"`
+			LabelListVisibility   string `json:"labelListVisibility"`
+			MessageListVisibility string `json:"messageListVisibility"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Name == "" || body.LabelListVisibility != "labelShow" || body.MessageListVisibility != "show" {
+			writeAPI(w, http.StatusBadRequest, "label visibility")
+			return
+		}
 		f.mu.Lock()
 		if f.labels == nil {
 			f.labels = map[string]string{}
@@ -206,7 +245,10 @@ func testGoogle(t *testing.T) (*Google, *fakeGoogle) {
 	fake := &fakeGoogle{users: map[string]bool{}, groups: map[string][]string{}, labels: map[string]string{}}
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
-	g, err := NewGoogleForTest("example.org", "admin@example.org", srv.URL, func(context.Context, string, []string) (*http.Client, error) {
+	g, err := NewGoogleForTest("example.org", "admin@example.org", srv.URL, func(_ context.Context, subject string, scopes []string) (*http.Client, error) {
+		fake.mu.Lock()
+		fake.scopes = append(fake.scopes, subject+"\t"+strings.Join(scopes, " "))
+		fake.mu.Unlock()
 		return srv.Client(), nil
 	})
 	if err != nil {
@@ -288,9 +330,15 @@ func TestGoogleGroupSendAs(t *testing.T) {
 	if err := g.CreateMailbox(ctx, mb); err != nil {
 		t.Fatal(err)
 	}
+	// The alias is already there. Restoring must treat that conflict as success
+	// and must not create a second alias.
+	if err := g.RestoreMailbox(ctx, mb); err != nil {
+		t.Fatalf("send-as already present: %v", err)
+	}
 	fake.mu.Lock()
 	members := append([]string{}, fake.groups["press@example.org"]...)
 	aliases := append([]string{}, fake.aliases...)
+	scopes := append([]string{}, fake.scopes...)
 	fake.mu.Unlock()
 	if strings.Join(members, ",") != "desk@example.org" {
 		t.Fatalf("members %v", members)
@@ -298,8 +346,16 @@ func TestGoogleGroupSendAs(t *testing.T) {
 	if strings.Join(aliases, ",") != "press@example.org" {
 		t.Fatalf("send-as %v", aliases)
 	}
+	sendAs := "desk@example.org\t" + strings.Join(gworkspace.SendAsScopes(), " ")
+	if !contains(scopes, sendAs) {
+		t.Fatalf("send-as scopes %q missing from %v", sendAs, scopes)
+	}
 	if err := g.SuspendMailbox(ctx, mb); err != nil {
 		t.Fatal(err)
+	}
+	// The alias is gone. Suspending again must treat that as success.
+	if err := g.SuspendMailbox(ctx, mb); err != nil {
+		t.Fatalf("send-as already gone: %v", err)
 	}
 	if err := g.RestoreMailbox(ctx, mb); err != nil {
 		t.Fatal(err)
@@ -307,4 +363,54 @@ func TestGoogleGroupSendAs(t *testing.T) {
 	if err := g.DeleteMailbox(ctx, mb); err != nil {
 		t.Fatal(err)
 	}
+	if err := g.DeleteMailbox(ctx, mb); err != ErrNotFound {
+		t.Fatalf("second delete: %v", err)
+	}
+}
+
+func TestGoogleSendAsDenied(t *testing.T) {
+	g, fake := testGoogle(t)
+	fake.mu.Lock()
+	fake.denySendAs = true
+	fake.mu.Unlock()
+	mb := Mailbox{Kind: KindGroup, Address: "press@example.org", DisplayName: "Press", DeliverTo: "desk@example.org"}
+	if err := g.CreateMailbox(context.Background(), mb); err != ErrSendAsDenied {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestGoogleMailUsesModifyScope(t *testing.T) {
+	g, fake := testGoogle(t)
+	ctx := context.Background()
+	if err := g.CreateMailbox(ctx, Mailbox{Kind: KindUser, Address: "info@example.org", DisplayName: "Info Desk"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.AddLabel(ctx, "info@example.org", "m1", "Desk"); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Untrash(ctx, "info@example.org", "m1"); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	scopes := append([]string{}, fake.scopes...)
+	fake.mu.Unlock()
+	want := "info@example.org\t" + strings.Join(gworkspace.GmailScopes, " ")
+	if !contains(scopes, want) {
+		t.Fatalf("gmail scopes %q missing from %v", want, scopes)
+	}
+	sendAs := strings.Join(gworkspace.SendAsScopes(), " ")
+	for _, s := range scopes {
+		if strings.Contains(s, sendAs) {
+			t.Fatalf("label and untrash must not request %s: %v", gworkspace.SendAsScope, scopes)
+		}
+	}
+}
+
+func contains(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }

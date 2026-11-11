@@ -1,43 +1,29 @@
 // Google is a mailprovider.Provider on top of the shared Workspace client
 // (shared/go/gworkspace): a service account with domain-wide delegation.
 //
-// Calls the shared client does not have are made here, against the same
-// Gmail REST API, and reported as shared-package gaps (do not add them in
-// Desk's copy of internal/gworkspace):
-//
-//   - list and create a Gmail label by name (users.labels)
-//   - untrash a message (users.messages.untrash)
-//   - create and delete a send-as alias (users.settings.sendAs), which
-//     needs the scope gmail.settings.sharing in addition to gmail.modify
-//
-// Directory user-alias APIs are not used. A google_group mailbox is a
-// Workspace group whose only member is the shared account, plus a send-as
-// alias on that account (docs/adr/0001).
+// Labels, untrash and send-as aliases go through that client. Creating or
+// deleting a send-as alias requests gworkspace.SendAsScopes (gmail.modify
+// plus gworkspace.SendAsScope, gmail.settings.sharing). A duplicate alias
+// and a missing alias are success: creating and suspending a group mailbox
+// can be repeated. Directory user-alias APIs are not used. A google_group
+// mailbox is a Workspace group whose only member is the shared account,
+// plus a send-as alias on that account (docs/adr/0001).
 package mailprovider
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 
 	"github.com/AGlElectronics/desk/backend/internal/gworkspace"
 )
 
-// SendAsScope is the extra OAuth scope a send-as alias needs. Authorise it
-// for the service account next to gworkspace.GmailScopes.
-const SendAsScope = "https://www.googleapis.com/auth/gmail.settings.sharing"
-
 // Google implements Provider with the shared Workspace client.
 type Google struct {
 	ws     *gworkspace.Client
-	gap    *gapAPI
 	mu     sync.Mutex
 	labels map[string]string // mailbox+"\n"+name -> label id
 }
@@ -49,33 +35,18 @@ func NewGoogle(cfg gworkspace.Config) (*Google, error) {
 	if err != nil {
 		return nil, err
 	}
-	key, err := os.ReadFile(cfg.CredentialsFile)
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", gworkspace.EnvCredentialsFile, err)
-	}
-	hc, err := gworkspace.ServiceAccount(key)
-	if err != nil {
-		return nil, err
-	}
-	return newGoogle(client, hc, gworkspace.DefaultGmailURL, cfg.Domain), nil
+	return &Google{ws: client, labels: map[string]string{}}, nil
 }
 
-// NewGoogleForTest points both the shared client and Desk's extra calls at
-// base (an httptest server). hc authorises every request; tests ignore it.
+// NewGoogleForTest points the shared client at base (an httptest server).
+// hc authorises every request; tests ignore it.
 func NewGoogleForTest(domain, admin, base string, hc gworkspace.HTTPClientFunc) (*Google, error) {
 	cfg := gworkspace.Config{CredentialsFile: "unused", AdminEmail: admin, Domain: domain}
 	client, err := gworkspace.New(cfg, gworkspace.Options{DirectoryURL: base, GmailURL: base, HTTPClient: hc})
 	if err != nil {
 		return nil, err
 	}
-	return newGoogle(client, hc, base, domain), nil
-}
-
-func newGoogle(client *gworkspace.Client, hc gworkspace.HTTPClientFunc, gmailURL, domain string) *Google {
-	return &Google{
-		ws: client, labels: map[string]string{},
-		gap: &gapAPI{http: hc, gmailURL: strings.TrimRight(gmailURL, "/"), domain: domain},
-	}
+	return &Google{ws: client, labels: map[string]string{}}, nil
 }
 
 func (g *Google) CreateMailbox(ctx context.Context, m Mailbox) error {
@@ -102,7 +73,7 @@ func (g *Google) CreateMailbox(ctx context.Context, m Mailbox) error {
 		if _, err := g.ws.AddMember(ctx, m.Address, gworkspace.Member{Email: m.DeliverTo, Role: gworkspace.RoleMember}); err != nil && !gworkspace.IsConflict(err) {
 			return mapGoogle(err)
 		}
-		return g.gap.ensureSendAs(ctx, m.DeliverTo, m.Address, name)
+		return g.ensureSendAs(ctx, m.DeliverTo, m.Address, name)
 	default:
 		return fmt.Errorf("unknown mailbox kind %q", m.Kind)
 	}
@@ -113,7 +84,7 @@ func (g *Google) SuspendMailbox(ctx context.Context, m Mailbox) error {
 		if err := g.ws.RemoveMember(ctx, m.Address, m.DeliverTo); err != nil && !gworkspace.IsNotFound(err) {
 			return mapGoogle(err)
 		}
-		return g.gap.deleteSendAs(ctx, m.DeliverTo, m.Address)
+		return g.deleteSendAs(ctx, m.DeliverTo, m.Address)
 	}
 	_, err := g.ws.SetSuspended(ctx, m.Address, true)
 	return mapGoogle(err)
@@ -124,7 +95,7 @@ func (g *Google) RestoreMailbox(ctx context.Context, m Mailbox) error {
 		if _, err := g.ws.AddMember(ctx, m.Address, gworkspace.Member{Email: m.DeliverTo, Role: gworkspace.RoleMember}); err != nil && !gworkspace.IsConflict(err) {
 			return mapGoogle(err)
 		}
-		return g.gap.ensureSendAs(ctx, m.DeliverTo, m.Address, m.DisplayName)
+		return g.ensureSendAs(ctx, m.DeliverTo, m.Address, m.DisplayName)
 	}
 	_, err := g.ws.SetSuspended(ctx, m.Address, false)
 	return mapGoogle(err)
@@ -132,7 +103,7 @@ func (g *Google) RestoreMailbox(ctx context.Context, m Mailbox) error {
 
 func (g *Google) DeleteMailbox(ctx context.Context, m Mailbox) error {
 	if m.Kind == KindGroup {
-		_ = g.gap.deleteSendAs(ctx, m.DeliverTo, m.Address)
+		_ = g.deleteSendAs(ctx, m.DeliverTo, m.Address)
 		return mapGoogle(g.ws.DeleteGroup(ctx, m.Address))
 	}
 	return mapGoogle(g.ws.DeleteUser(ctx, m.Address))
@@ -201,7 +172,8 @@ func (g *Google) Trash(ctx context.Context, user, id string) error {
 }
 
 func (g *Google) Untrash(ctx context.Context, user, id string) error {
-	return g.gap.call(ctx, user, gworkspace.GmailScopes, http.MethodPost, "/messages/"+id+"/untrash", nil, nil)
+	_, err := g.ws.UntrashMessage(ctx, user, id)
+	return mapGoogle(err)
 }
 
 func (g *Google) labelID(ctx context.Context, user, name string) (string, error) {
@@ -212,29 +184,21 @@ func (g *Google) labelID(ctx context.Context, user, name string) (string, error)
 		return id, nil
 	}
 	g.mu.Unlock()
-	var listed struct {
-		Labels []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"labels"`
+	listed, err := g.ws.ListLabels(ctx, user)
+	if err != nil {
+		return "", mapGoogle(err)
 	}
-	if err := g.gap.call(ctx, user, gworkspace.GmailScopes, http.MethodGet, "/labels", nil, &listed); err != nil {
-		return "", err
-	}
-	for _, l := range listed.Labels {
+	for _, l := range listed {
 		if l.Name == name {
 			g.remember(key, l.ID)
 			return l.ID, nil
 		}
 	}
-	var created struct {
-		ID string `json:"id"`
+	created, err := g.ws.CreateLabel(ctx, user, name)
+	if err != nil {
+		return "", mapGoogle(err)
 	}
-	body := map[string]string{"name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}
-	if err := g.gap.call(ctx, user, gworkspace.GmailScopes, http.MethodPost, "/labels", body, &created); err != nil {
-		return "", err
-	}
-	if created.ID == "" {
+	if created == nil || created.ID == "" {
 		return "", fmt.Errorf("google workspace: created label %q without an id", name)
 	}
 	g.remember(key, created.ID)
@@ -245,6 +209,29 @@ func (g *Google) remember(key, id string) {
 	g.mu.Lock()
 	g.labels[key] = id
 	g.mu.Unlock()
+}
+
+// ensureSendAs lets account send as alias. An alias that already exists is
+// success, so creating or restoring a group mailbox can be repeated.
+func (g *Google) ensureSendAs(ctx context.Context, account, alias, display string) error {
+	_, err := g.ws.CreateSendAs(ctx, account, alias, display)
+	if gworkspace.IsConflict(err) {
+		return nil
+	}
+	if st, ok := statusOf(err); ok && st == http.StatusForbidden {
+		return ErrSendAsDenied
+	}
+	return mapGoogle(err)
+}
+
+// deleteSendAs removes alias from account. An alias that is already gone is
+// success, so suspending or deleting a group mailbox can be repeated.
+func (g *Google) deleteSendAs(ctx context.Context, account, alias string) error {
+	err := g.ws.DeleteSendAs(ctx, account, alias)
+	if gworkspace.IsNotFound(err) {
+		return nil
+	}
+	return mapGoogle(err)
 }
 
 func splitName(display, email string) (given, family string) {
@@ -292,94 +279,4 @@ func statusOf(err error) (int, bool) {
 		return 0, false
 	}
 	return ae.Status, true
-}
-
-type gapAPI struct {
-	http     gworkspace.HTTPClientFunc
-	gmailURL string
-	domain   string
-}
-
-func (g *gapAPI) sendAsScopes() []string {
-	s := make([]string, 0, len(gworkspace.GmailScopes)+1)
-	s = append(s, gworkspace.GmailScopes...)
-	s = append(s, SendAsScope)
-	return s
-}
-
-func (g *gapAPI) ensureSendAs(ctx context.Context, account, alias, display string) error {
-	body := map[string]any{"sendAsEmail": alias, "displayName": display, "treatAsAlias": true}
-	err := g.call(ctx, account, g.sendAsScopes(), http.MethodPost, "/settings/sendAs", body, nil)
-	if st, ok := statusOf(err); ok && st == http.StatusConflict {
-		return nil
-	}
-	if st, ok := statusOf(err); ok && st == http.StatusForbidden {
-		return ErrSendAsDenied
-	}
-	return err
-}
-
-func (g *gapAPI) deleteSendAs(ctx context.Context, account, alias string) error {
-	path := "/settings/sendAs/" + strings.ReplaceAll(alias, "@", "%40")
-	err := g.call(ctx, account, g.sendAsScopes(), http.MethodDelete, path, nil, nil)
-	if st, ok := statusOf(err); ok && st == http.StatusNotFound {
-		return nil
-	}
-	return err
-}
-
-func (g *gapAPI) call(ctx context.Context, mailbox string, scopes []string, method, path string, in, out any) error {
-	if !inDomain(g.domain, mailbox) {
-		return fmt.Errorf("google workspace: mailbox %q is not in the domain %s", mailbox, g.domain)
-	}
-	hc, err := g.http(ctx, mailbox, scopes)
-	if err != nil {
-		return err
-	}
-	var body io.Reader
-	if in != nil {
-		buf, err := json.Marshal(in)
-		if err != nil {
-			return err
-		}
-		body = bytes.NewReader(buf)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, g.gmailURL+"/users/me"+path, body)
-	if err != nil {
-		return err
-	}
-	if in != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	req.Header.Set("Accept", "application/json")
-	res, err := hc.Do(req)
-	if err != nil {
-		return fmt.Errorf("google workspace: %w", err)
-	}
-	defer func() { _ = res.Body.Close() }()
-	raw, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
-	if err != nil {
-		return err
-	}
-	if res.StatusCode < 200 || res.StatusCode > 299 {
-		ae := &gworkspace.APIError{Status: res.StatusCode, Message: res.Status}
-		var e struct {
-			Error struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if json.Unmarshal(raw, &e) == nil && e.Error.Message != "" {
-			ae.Message = e.Error.Message
-		}
-		return ae
-	}
-	if out == nil || len(raw) == 0 {
-		return nil
-	}
-	return json.Unmarshal(raw, out)
-}
-
-func inDomain(domain, email string) bool {
-	_, d, ok := strings.Cut(strings.ToLower(strings.TrimSpace(email)), "@")
-	return ok && d != "" && d == strings.ToLower(domain)
 }

@@ -1,0 +1,43 @@
+# Security headers for /silent-callback.html only. Source: con-services
+# shared/nginx/security-headers-frame-self.conf.template.
+# Docs: https://aglelectronics.github.io/con-services/concepts/shared-code/#silent-sign-in-iframe
+#
+# oidc-client-ts silent renew (tokens kept in memory) loads this page in a
+# hidden iframe of the app itself. The shared policy refuses every frame
+# (frame-ancestors 'none', X-Frame-Options DENY), which blocks that iframe.
+# This file is the same policy with frame-ancestors 'self' and
+# X-Frame-Options SAMEORIGIN, and nothing else changed.
+#
+# Include it only from an exact location. Every other location keeps
+# security-headers.conf:
+#
+#   location = /silent-callback.html {
+#       include /etc/nginx/snippets/security-headers-frame-self.conf;
+#       add_header Cache-Control "no-cache" always;
+#   }
+#
+# Copy this file next to security-headers.conf.template and into the image
+# the same way (/etc/nginx/templates/security-headers-frame-self.conf.template).
+# The nginx image writes /etc/nginx/snippets/security-headers-frame-self.conf
+# at start-up. The same NGINX_ENVSUBST_FILTER has to name EXTRA_FRAME_SRC
+# too, and EXTRA_FRAME_SRC="" stays the default. Do not use this snippet on
+# location / or at server level: that would let other sites embed the app.
+#
+# Variables (same as security-headers.conf.template): KEYCLOAK_ORIGIN,
+# DEN_ORIGIN, S3_ORIGIN, EXTRA_CONNECT_SRC, EXTRA_FRAME_SRC.
+
+# Same policy as security-headers.conf.template. This one page may be
+# framed by the app itself; forms still post only to itself or Keycloak.
+add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: ${S3_ORIGIN}; font-src 'self' data:; connect-src 'self' ${KEYCLOAK_ORIGIN} ${DEN_ORIGIN} ${S3_ORIGIN} ${EXTRA_CONNECT_SRC}; frame-src 'self' ${EXTRA_FRAME_SRC} ${KEYCLOAK_ORIGIN}; frame-ancestors 'self'; form-action 'self' ${KEYCLOAK_ORIGIN}; base-uri 'self'; object-src 'none'" always;
+
+# Older browsers that do not know frame-ancestors. SAMEORIGIN, not DENY.
+add_header X-Frame-Options "SAMEORIGIN" always;
+
+# Never guess a content type from the bytes.
+add_header X-Content-Type-Options "nosniff" always;
+
+# Send only the origin to other sites, nothing over plain HTTP.
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+# Browser features. Stash's copy uses camera=(self); see the main template.
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()" always;

@@ -177,6 +177,10 @@ services:
       args:
         DESK_VERSION: ${DESK_VERSION:-dev}
     container_name: desk-frontend
+    environment:
+      # Sandboxed customer mail is an srcdoc iframe. Without this token the
+      # mail pane stays blank. Not an origin: the token itself.
+      EXTRA_FRAME_SRC: "about:srcdoc"
     volumes:
       # Web app settings (/config.json). Dev sign-in by default; for real
       # sign-in set FRONTEND_CONFIG to your own file (docs: configuration).
