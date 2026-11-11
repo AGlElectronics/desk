@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/AGlElectronics/desk/backend/internal/blob"
 	"github.com/AGlElectronics/desk/backend/internal/httperror"
 	"github.com/AGlElectronics/desk/backend/internal/netguard"
 	"github.com/AGlElectronics/desk/backend/internal/secretbox"
@@ -45,6 +46,8 @@ type Options struct {
 	// AllowedMailHosts may resolve to private addresses
 	// (DESK_ALLOWED_MAIL_HOSTS); every other mailbox host may not.
 	AllowedMailHosts []string
+	// Blobs stores attachments and raw mail (S3).
+	Blobs blob.Store
 }
 
 // Service is safe for concurrent use.
@@ -54,6 +57,7 @@ type Service struct {
 	smtp  SMTPSettings
 	dev   bool
 	guard *netguard.Guard
+	blobs blob.Store
 	// fetchInterval is the polling interval back-off starts from.
 	fetchInterval time.Duration
 	// fetchNow wakes the fetcher early ("Fetch now" in the UI).
@@ -65,9 +69,13 @@ func NewService(pool *pgxpool.Pool, opts Options) *Service {
 	if opts.Keyring == nil {
 		panic("desk: Options.Keyring is required")
 	}
+	if opts.Blobs == nil {
+		opts.Blobs = blob.NewMemory()
+	}
 	return &Service{
 		pool: pool, keys: opts.Keyring, smtp: opts.SMTP, dev: opts.Development,
 		guard:         netguard.New(opts.AllowedMailHosts),
+		blobs:         opts.Blobs,
 		fetchInterval: time.Minute,
 		fetchNow:      make(chan uuid.UUID, 16),
 	}

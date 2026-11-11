@@ -341,8 +341,10 @@ func (s *Service) ingest(ctx context.Context, mb Mailbox, raw []byte, source str
 	}
 	res, err := s.Import(ctx, mb, p, raw)
 	if err != nil {
+		// The server rejected this message's data: skip it. Anything else
+		// (connection, S3, cancellation) is retried on the next run.
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) || errors.Is(err, errUnstorable) {
+		if errors.As(err, &pgErr) {
 			log.Warn().Err(err).Str("mailbox", mb.Email).Str("source", source).Msg("message could not be stored; skipped")
 			s.recordImportFailure(ctx, mb.ID, source, p, int64(len(raw)), "the message could not be stored")
 			return false, nil
@@ -351,10 +353,6 @@ func (s *Service) ingest(ctx context.Context, mb Mailbox, raw []byte, source str
 	}
 	return !res.Duplicate && res.Skipped == "", nil
 }
-
-// errUnstorable marks a message-specific failure while storing it (for
-// example its attachment could not be written to S3).
-var errUnstorable = errors.New("message could not be stored")
 
 func (s *Service) recordImportFailure(ctx context.Context, mailboxID uuid.UUID, source string, p *ParsedMessage, size int64, reason string) {
 	var subject, from string

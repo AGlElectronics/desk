@@ -18,6 +18,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/AGlElectronics/desk/backend/internal/auth"
+	"github.com/AGlElectronics/desk/backend/internal/blob"
 	"github.com/AGlElectronics/desk/backend/internal/brand"
 	"github.com/AGlElectronics/desk/backend/internal/config"
 	"github.com/AGlElectronics/desk/backend/internal/db"
@@ -92,7 +93,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	}
 	go den.Run(ctx)
 
-	deskSvc, err := newDeskService(pool, cfg)
+	deskSvc, err := newDeskService(ctx, pool, cfg)
 	if err != nil {
 		return err
 	}
@@ -133,12 +134,22 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	return runServer(ctx, server, stopWorkers, cfg.ShutdownTimeout, logger)
 }
 
-func newDeskService(pool *pgxpool.Pool, cfg *config.Config) (*desk.Service, error) {
+func newDeskService(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config) (*desk.Service, error) {
 	keys, err := secretbox.New(cfg.SecretKey, cfg.PreviousSecretKeys...)
 	if err != nil {
 		return nil, fmt.Errorf("secret key: %w", err)
 	}
+	s3ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	blobs, err := blob.NewS3(s3ctx, blob.S3Config{
+		Endpoint: cfg.S3Endpoint, Bucket: cfg.S3Bucket, Region: cfg.S3Region, UsePathStyle: cfg.S3UsePathStyle,
+		AccessKeyID: cfg.S3AccessKeyID, SecretAccessKey: cfg.S3SecretAccessKey, CreateBucket: cfg.IsDevelopment(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("object storage: %w", err)
+	}
 	return desk.NewService(pool, desk.Options{
+		Blobs:   blobs,
 		Keyring: keys,
 		SMTP: desk.SMTPSettings{
 			Host: cfg.SMTPHost, Port: cfg.SMTPPort, Security: cfg.SMTPSecurity,
@@ -162,7 +173,7 @@ func Reencrypt(ctx context.Context, logger zerolog.Logger) error {
 		return fmt.Errorf("open db: %w", err)
 	}
 	defer pool.Close()
-	svc, err := newDeskService(pool, cfg)
+	svc, err := newDeskService(ctx, pool, cfg)
 	if err != nil {
 		return err
 	}

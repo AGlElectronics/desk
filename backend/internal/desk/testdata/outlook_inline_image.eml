@@ -1,0 +1,49 @@
+From: "Maria Example" <Maria.Example@Example.com>
+To: support@desk.test
+Cc: "Team Lead" <lead@example.com>
+Subject: Badge photo for registration
+Date: Tue, 10 Nov 2026 09:12:44 +0000
+Message-ID: <AM0PR01MB1234ABCD@AM0PR01MB1234.eurprd01.prod.exchangelabs.com>
+Content-Language: en-US
+MIME-Version: 1.0
+Content-Type: multipart/related;
+	boundary="_004_AM0PR01MB_";
+	type="multipart/alternative"
+
+--_004_AM0PR01MB_
+Content-Type: multipart/alternative;
+	boundary="_000_AM0PR01MB_"
+
+--_000_AM0PR01MB_
+Content-Type: text/plain; charset="us-ascii"
+Content-Transfer-Encoding: quoted-printable
+
+Hi, here is my badge photo.
+
+[cid:image001.png@01DB1234.ABCDEF00]
+
+See https://example.com/convention for details.
+
+--_000_AM0PR01MB_
+Content-Type: text/html; charset="us-ascii"
+Content-Transfer-Encoding: quoted-printable
+
+<html><head><script>alert(1)</script></head><body>
+<p>Hi, here is my badge photo.</p>
+<p><img width=3D"120" height=3D"80" src=3D"cid:image001.png@01DB1234.ABCDEF00" alt=3D"photo"></p>
+<p>See <a href=3D"https://example.com/convention">the convention page</a>.</p>
+<p onclick=3D"steal()">Thanks</p>
+</body></html>
+
+--_000_AM0PR01MB_--
+
+--_004_AM0PR01MB_
+Content-Type: image/png; name="image001.png"
+Content-Description: image001.png
+Content-Disposition: inline; filename="image001.png"; size=68
+Content-ID: <image001.png@01DB1234.ABCDEF00>
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=
+
+--_004_AM0PR01MB_--

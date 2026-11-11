@@ -1,9 +1,11 @@
 package http
 
 import (
+	"io"
 	"mime"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/hlog"
@@ -364,16 +366,47 @@ func (h *deskHandler) downloadAttachment(w http.ResponseWriter, r *http.Request)
 		httperror.Render(w, r, err)
 		return
 	}
-	a, content, _, err := h.svc.Attachment(r.Context(), id)
+	a, _, key, err := h.svc.AttachmentInfo(r.Context(), id)
 	if err != nil {
 		httperror.Render(w, r, err)
 		return
 	}
-	w.Header().Set("Content-Type", a.ContentType)
-	w.Header().Set("Content-Length", strconv.Itoa(len(content)))
-	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": a.Filename}))
+	body, size, err := h.svc.OpenAttachment(r.Context(), key)
+	if err != nil {
+		httperror.Render(w, r, err)
+		return
+	}
+	defer body.Close()
+	ct, disposition := servedType(a.ContentType)
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": a.Filename}))
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	_, _ = w.Write(content)
+	// Even if a browser renders the file, it gets no scripts, no forms and
+	// no access to Desk's origin.
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'")
+	w.Header().Set("Cache-Control", "private, no-store")
+	_, _ = io.Copy(w, body)
+}
+
+// inlineTypes may be shown in the browser (images for inline cid: parts,
+// PDFs and plain text for previews). Everything else, including HTML and
+// SVG from senders, is served as a download of application/octet-stream.
+var inlineTypes = map[string]bool{
+	"image/png": true, "image/jpeg": true, "image/gif": true, "image/webp": true,
+	"application/pdf": true, "text/plain": true,
+}
+
+func servedType(declared string) (contentType, disposition string) {
+	mt, _, err := mime.ParseMediaType(declared)
+	if err != nil || !inlineTypes[strings.ToLower(mt)] {
+		return "application/octet-stream", "attachment"
+	}
+	mt = strings.ToLower(mt)
+	if mt == "text/plain" {
+		return "text/plain; charset=utf-8", "inline"
+	}
+	return mt, "inline"
 }
 
 func (h *deskHandler) listPeople(w http.ResponseWriter, r *http.Request) {

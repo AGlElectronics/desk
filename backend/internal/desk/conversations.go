@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"net/mail"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/AGlElectronics/desk/backend/internal/blob"
 	"github.com/AGlElectronics/desk/backend/internal/domain"
 	"github.com/AGlElectronics/desk/backend/internal/httperror"
 )
@@ -52,6 +54,9 @@ type AttachmentMeta struct {
 	Filename    string    `json:"filename"`
 	ContentType string    `json:"content_type"`
 	SizeBytes   int       `json:"size_bytes"`
+	// ContentID and Inline: an inline image the HTML body refers to.
+	ContentID string `json:"content_id,omitempty"`
+	Inline    bool   `json:"inline"`
 }
 
 // Thread is one message, note or system line in a conversation.
@@ -216,7 +221,7 @@ func (s *Service) Detail(ctx context.Context, c Conversation, viewerID uuid.UUID
 	}
 
 	rows, err = s.pool.Query(ctx, `
-		SELECT a.thread_id, a.id, a.filename, a.content_type, a.size_bytes
+		SELECT a.thread_id, a.id, a.filename, a.content_type, a.size_bytes, a.content_id, a.inline
 		  FROM attachments a JOIN threads t ON t.id = a.thread_id
 		 WHERE t.conversation_id = $1 ORDER BY a.created_at`, c.ID)
 	if err != nil {
@@ -225,7 +230,7 @@ func (s *Service) Detail(ctx context.Context, c Conversation, viewerID uuid.UUID
 	for rows.Next() {
 		var threadID uuid.UUID
 		var a AttachmentMeta
-		if err := rows.Scan(&threadID, &a.ID, &a.Filename, &a.ContentType, &a.SizeBytes); err != nil {
+		if err := rows.Scan(&threadID, &a.ID, &a.Filename, &a.ContentType, &a.SizeBytes, &a.ContentID, &a.Inline); err != nil {
 			rows.Close()
 			return d, err
 		}
@@ -532,19 +537,28 @@ func (s *Service) UpdateCustomer(ctx context.Context, id uuid.UUID, name, notes 
 	return err
 }
 
-// Attachment returns one attachment with its content.
-func (s *Service) Attachment(ctx context.Context, id uuid.UUID) (AttachmentMeta, []byte, uuid.UUID, error) {
+// AttachmentInfo locates one attachment: its metadata and conversation.
+func (s *Service) AttachmentInfo(ctx context.Context, id uuid.UUID) (AttachmentMeta, uuid.UUID, string, error) {
 	var a AttachmentMeta
-	var content []byte
 	var convID uuid.UUID
+	var key string
 	err := s.pool.QueryRow(ctx, `
-		SELECT a.id, a.filename, a.content_type, a.size_bytes, a.content, t.conversation_id
+		SELECT a.id, a.filename, a.content_type, a.size_bytes, a.content_id, a.inline, a.storage_key, t.conversation_id
 		  FROM attachments a JOIN threads t ON t.id = a.thread_id WHERE a.id = $1`, id,
-	).Scan(&a.ID, &a.Filename, &a.ContentType, &a.SizeBytes, &content, &convID)
+	).Scan(&a.ID, &a.Filename, &a.ContentType, &a.SizeBytes, &a.ContentID, &a.Inline, &key, &convID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return a, nil, uuid.Nil, httperror.NotFound("attachment")
+		return a, uuid.Nil, "", httperror.NotFound("attachment")
 	}
-	return a, content, convID, err
+	return a, convID, key, err
+}
+
+// OpenAttachment streams an attachment's content from object storage.
+func (s *Service) OpenAttachment(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	r, size, err := s.blobs.Get(ctx, key)
+	if errors.Is(err, blob.ErrNotFound) {
+		return nil, 0, httperror.NotFound("attachment content")
+	}
+	return r, size, err
 }
 
 // ----------------------------------------------------------------------------
