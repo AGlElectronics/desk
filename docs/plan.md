@@ -8,7 +8,11 @@ browser. Customers never log in; to them it is plain email. Same shape as
 every other module (own database, own bucket, OIDC against the shared
 Keycloak, role catalog, Den pairing, Den's nightly backups).
 
-Status: **planning**. Nothing here is built yet.
+Status: **built** (milestones 1–7, released as `1.0.0`). This page is the
+original plan. Where the build differs, the section
+"[Built differently from the plan](#built-differently-from-the-plan)" says
+how, and the decisions are recorded in [`docs/adr/`](adr/). The user and
+operator documentation is the Desk section of the documentation site.
 
 ## Decisions so far
 
@@ -265,14 +269,37 @@ lock per mailbox. `strategy: Recreate`, no volume.
   from a conversation (see `tasks/docs/plan.md`).
 - Multiple languages for auto-replies.
 
-## Open questions
+## Open questions (answered)
 
-- Which real mailboxes first, and where are they hosted (own mail server,
-  Microsoft 365, Gmail)? Microsoft 365 and Gmail increasingly refuse IMAP
-  passwords, which would pull OAuth2 into the first slice.
-- Should Desk delete or move fetched mail on the server (FreeScout can), or
-  only mark it read?
-- Retention: how long to keep closed conversations and raw `.eml` (GDPR —
-  attendee emails contain personal data)?
-- Should mailbox access be a role per mailbox in HR's picker (one Keycloak
-  group per mailbox) instead of grants inside Desk?
+- *Which real mailboxes first, and where are they hosted?* Google
+  Workspace. Mailboxes are created in Google from Desk, as a licensed user
+  (`google_user`) or a free group routed into one shared account
+  (`google_group`); IMAP/SMTP stays as the connector for everything else.
+  See [ADR 0001](adr/0001-mailboxes-in-google-workspace.md).
+- *Delete or move fetched mail on the server?* Neither by default. Gmail
+  mail gets the label `Desk`; IMAP mail is marked `\Seen`, with an optional
+  per-mailbox move to a folder. Deleting in Desk also moves the message to
+  Gmail's trash. See [ADR 0002](adr/0002-desk-keeps-its-own-copy.md) and
+  [ADR 0006](adr/0006-trash-and-purge.md).
+- *Retention?* Configurable periods from Den's module settings, Desk's own
+  setting as fallback; the defaults keep everything until legal review.
+  See [ADR 0005](adr/0005-retention.md).
+- *Role per mailbox instead of grants?* Yes: three roles per mailbox
+  (viewer, manager, delete) in the role catalog, plus Desk admin. See
+  [ADR 0003](adr/0003-per-mailbox-roles.md).
+
+## Built differently from the plan
+
+| Plan | Built | Why |
+| --- | --- | --- |
+| Mailbox grants inside Desk, `desk-agent` role as master switch | Roles `desk_<slug>_viewer`, `_manager`, `_delete` per mailbox, granted by groups `desk-<slug>-*`; `desk-agent` removed | HR already assigns module roles through groups ([ADR 0003](adr/0003-per-mailbox-roles.md)). |
+| IMAP/SMTP only, OAuth2 later | Google Workspace connectors first, IMAP/SMTP second | Mail lives in Google ([ADR 0001](adr/0001-mailboxes-in-google-workspace.md)). |
+| Sending with `wneessen/go-mail` | Go's `net/smtp` with Desk's own MIME writer | Fewer dependencies; Desk needs only `multipart/alternative` and attachments. |
+| One fetch goroutine per mailbox | One fetcher loop; Google group mailboxes share one read of the shared account | Group mailboxes are one Gmail account, routed by recipient. |
+| `DESK_SECRET_KEY` of 32 bytes, lose it and re-enter passwords | At least 32 characters, versioned and rotatable with `DESK_SECRET_KEY_PREVIOUS` and `server reencrypt` | [ADR 0008](adr/0008-rotatable-secret-key.md). |
+| Plain IMAP allowed per mailbox | Plaintext only with `APP_ENV=development`; private addresses blocked unless in `DESK_ALLOWED_MAIL_HOSTS` | [ADR 0004](adr/0004-mail-host-safety.md). |
+| Auto-reply at most once per customer per hour | At most once per customer and mailbox per 24 hours | Fewer loops with other auto-responders (RFC 3834). |
+| Delete to trash, admins empty it | Emails, conversations and mailboxes go to Desk's trash (and Gmail's); automatic purge, reminders, audit log | [ADR 0006](adr/0006-trash-and-purge.md). |
+| Notification settings per mailbox | Two per-person switches (new conversations, assigned to me), opt-in, sent through an outbox | Simpler first version; per-mailbox can come later. |
+| `GET /api/search` | Search is the `q` parameter of `GET /api/v1/conversations` | One list endpoint with folders, tags and search. |
+| Reply attachments by multipart upload | Not in 1.0.0: replies are text and HTML; incoming attachments are stored and served | Left for a later minor release. |

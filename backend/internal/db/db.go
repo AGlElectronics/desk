@@ -4,7 +4,8 @@
 //
 // Note: this package deliberately does NOT expose a MigrateUp function.
 // Migrations run via cmd/migrate as a controlled one-shot (Compose service
-// or K8s Job). See docs/adr/0003-migrate-job.md for the rationale.
+// or Kubernetes initContainer), so a schema change runs once, before any
+// backend starts, and the backend's database login needs no DDL rights.
 package db
 
 import (

@@ -15,15 +15,69 @@ counts rebuilds of the same version. Rebuilds get no entry here.
 
 ### Added
 
-- Shared-inbox helpdesk: each support address is a mailbox with its own
-  IMAP account and optionally its own SMTP server (otherwise a module-wide
-  fallback), with a connection test that changes nothing. Customers never
-  sign in; to them it is plain email.
-- Every email thread becomes a conversation that agents assign, answer,
-  annotate and close in the browser, with one assignee per conversation, a
-  10-second undo, collision warnings and folder counts per person.
-- Roles `desk-agent` and `desk-admin`, published in the role catalog so HR
-  can grant them during onboarding.
+- Shared-inbox helpdesk: each support address is a mailbox, and every email
+  thread becomes a conversation that staff assign, answer, annotate and
+  close in the browser. Customers never sign in; to them it is plain email.
+- Mailboxes in **Google Workspace**. A Desk admin creates the mailbox in
+  Desk and Desk creates it in Google, either as its own licensed user
+  (connector `google_user`) or as a free group delivered into one shared
+  account and routed by recipient (`google_group`, replies sent "send as"
+  the group address). Needs a service account with domain-wide delegation;
+  see [Google Workspace setup](https://aglelectronics.github.io/con-services/modules/desk/google-workspace/).
+  New settings `GOOGLE_WORKSPACE_DOMAIN`, `GOOGLE_SERVICE_ACCOUNT_FILE`,
+  `GOOGLE_ADMIN_USER`, `GOOGLE_SHARED_MAILBOX` and `GOOGLE_LABEL`
+  (default `Desk`). Mail Desk has handled gets the Gmail label `Desk`.
+- **IMAP/SMTP** connector for mail servers outside Google: IMAP polling and
+  SMTP per mailbox (or the module-wide `SMTP_*` server), a connection test
+  that changes nothing, mail marked `\Seen` after import and an optional
+  "move to folder". See [IMAP setup](https://aglelectronics.github.io/con-services/modules/desk/imap/).
+- **Roles per mailbox.** Every mailbox publishes three roles in the role
+  catalog, granted by Keycloak groups: `desk-<slug>-viewer` (read),
+  `desk-<slug>-manager` (reply, note, assign, close, tag, saved replies,
+  signature, auto-reply) and `desk-<slug>-delete` (delete and restore).
+  `desk-admin` is the Desk admin role for every mailbox, mailbox setup,
+  retention and the audit log. See
+  [Access](https://aglelectronics.github.io/con-services/modules/desk/access/).
+- Attachments, inline images and the raw `.eml` of every message are stored
+  in the module's S3 bucket (`desk-data`); add it to Den's
+  `FILES_S3_BUCKETS` so backups include it. New required settings
+  `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`,
+  optional `S3_REGION` and `S3_USE_PATH_STYLE`.
+- Folders Unassigned, Mine, Assigned, Pending, Closed, Spam, All, Starred
+  and Trash with counts; search, tag filter and paging (50 per page, at
+  most 100) in the conversation list.
+- Replies, notes, forwards and new conversations with a rich text editor
+  (BlockNote), sent as HTML with a plain-text alternative; reply-all with
+  editable CC (at most 20 addresses); a 10-second undo; a Retry button for
+  replies that could not be sent; collision warnings ("Alice is replying").
+- Tags (at most 20 per conversation), stars, merge two conversations, move
+  a conversation to another mailbox, start a conversation with a customer.
+- Customer profiles: name, notes, several addresses, past conversations,
+  merge two customers, and customer search.
+- Per-mailbox signature, auto-reply (never to automatic, list or `noreply`
+  mail, at most once per customer and mailbox in 24 hours) and saved
+  replies (per mailbox or global).
+- Email notifications for new conversations and conversations assigned to
+  you, off by default, each person turns them on under Settings. Needs the
+  new `NOTIFY_FROM` and either `SMTP_HOST` or the Google shared mailbox.
+- **Trash.** Deleting an email or conversation moves it to Desk's trash and
+  the message to Gmail's trash; both can be restored. Deleting a mailbox
+  moves it to Desk's mailbox trash and suspends it in Google; it is purged
+  automatically after 30 days (configurable), and Desk admins get email
+  reminders 7 days and 1 day before.
+- **Retention**: periods for closed conversations, attachments, raw mail,
+  the trash and the mailbox trash, from Den's module settings or Desk's own
+  Settings page. Until someone sets them, Desk keeps everything and the
+  Settings page shows "pending legal review".
+- **Audit log** (`GET /api/v1/audit`, Desk admins) of mailbox changes,
+  deletes, restores, purges and retention runs.
+- Keyboard shortcuts in the web app (`?` lists them).
+- `DESK_ALLOWED_MAIL_HOSTS` (optional): host names or CIDRs of mail servers
+  on private addresses that Desk may connect to.
+- `server reencrypt` command and `DESK_SECRET_KEY_PREVIOUS` to rotate
+  `DESK_SECRET_KEY`; see
+  [Operations](https://aglelectronics.github.io/con-services/modules/desk/operations/#rotate-desk_secret_key).
+- Architecture decisions in `docs/adr/` (0001–0009).
 - `DEN_MODE=required` keeps the module locked until it is paired with Den:
   the API answers `503 den_pairing_required` (except health, brand, sign-in
   and the Den connection routes) and the public `GET /api/den/state`
@@ -70,10 +124,51 @@ counts rebuilds of the same version. Rebuilds get no entry here.
   an SBOM published to GHCR on version tags (linux/amd64; linux/arm64
   optional).
 
+### Changed
+
+- **BREAKING (pre-release builds only):** the roles `desk-agent`
+  (`agent`, permission `tickets.work`) are gone. Add people to the groups
+  `desk-<slug>-viewer`, `desk-<slug>-manager` or `desk-<slug>-delete` of
+  each mailbox instead (HR's access picker lists them), and remove the
+  `desk-agent` group from Keycloak.
+- **BREAKING (pre-release builds only):** S3 is now required; attachments
+  are no longer stored in PostgreSQL. Set the `S3_*` settings and create the
+  bucket before upgrading a development database.
+- The backend refuses to start on invalid settings (`FETCH_INTERVAL`
+  under 5 seconds, a short `DESK_SECRET_KEY` outside development, a malformed `NOTIFY_FROM`, a Google
+  domain without a service account) instead of falling back to defaults.
+- On shutdown the fetcher and sender finish their current step before the
+  database closes; a reply being sent is queued again, never sent twice.
+- Helm chart `deploy/charts/desk`: S3 settings with the bucket `desk-data`
+  and the platform data egress to S3; optional Google Workspace settings,
+  the service account key mounted from a Secret, and egress to Google's
+  APIs; `NOTIFY_FROM` and `DESK_ALLOWED_MAIL_HOSTS`.
+
 ### Security
 
 - Mailbox passwords are encrypted at rest with `DESK_SECRET_KEY` and never
-  returned by the API.
+  returned by the API. Each value carries a key id and is bound to its
+  mailbox and column, so it cannot be copied to another mailbox. Outside
+  development the key must be at least 32 characters and not the built-in
+  development key.
+- Plaintext IMAP and SMTP (`security: none`, `SMTP_SECURITY=none`) are
+  refused outside `APP_ENV=development`.
+- Desk refuses to connect to private, loopback and link-local addresses
+  (checked at connect time) unless they are listed in
+  `DESK_ALLOWED_MAIL_HOSTS`; connection errors shown in the web app are
+  generic, details are only in the log.
+- Changing a mailbox's IMAP or SMTP host or username needs the password
+  again, so a stored password is never sent to a new host.
+- A failing mailbox is polled less often (doubling, at most hourly), which
+  avoids account lockouts.
+- Incoming HTML is sanitised and shown in a sandboxed frame with remote
+  images blocked until "Show images". Attachments are served with
+  `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`;
+  only images, PDF and plain text are shown inline, everything else is a
+  download.
+- Mailboxes and conversations you have no role for answer 404; mailbox
+  connection details (hosts, usernames, errors) are only shown to Desk
+  admins.
 - The backend reads the client address from `X-Forwarded-For` only when
   the connection comes from a trusted proxy (`TRUSTED_PROXY_CIDRS`), and
   ignores `X-Real-IP` and `True-Client-IP`.
