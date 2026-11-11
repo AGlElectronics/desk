@@ -178,7 +178,7 @@ func TestRetryStateMachine(t *testing.T) {
 	if strings.Contains(sendErr, "127.0.0.1") {
 		t.Fatalf("send error leaks the address: %q", sendErr)
 	}
-	if err := svc.RetryReply(ctx, id); err != nil {
+	if err := svc.RetryReply(ctx, NewAccess(anna.ID, nil, nil), mb, id); err != nil {
 		t.Fatal(err)
 	}
 	if status, attempts, _ := sendStatus(t, svc, id); status != "queued" || attempts != 0 {

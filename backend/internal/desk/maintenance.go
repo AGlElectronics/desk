@@ -50,7 +50,3 @@ func (s *Service) RunDaily(ctx context.Context, now time.Time, log zerolog.Logge
 func (s *Service) pruneViewers(ctx context.Context) {
 	_, _ = s.pool.Exec(ctx, `DELETE FROM viewers WHERE seen_at < now() - interval '5 minutes'`)
 }
-
-// applyRetention is filled in with the conversation trash and retention
-// purges.
-func (s *Service) applyRetention(context.Context, time.Time, zerolog.Logger) {}

@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AGlElectronics/desk/backend/internal/blob"
+	"github.com/AGlElectronics/desk/backend/internal/domain"
 	"github.com/AGlElectronics/desk/backend/internal/httperror"
 	"github.com/AGlElectronics/desk/backend/internal/netguard"
 	"github.com/AGlElectronics/desk/backend/internal/secretbox"
@@ -194,6 +195,7 @@ func (s *Service) Reencrypt(ctx context.Context) (ReencryptResult, error) {
 type Mailbox struct {
 	ID              uuid.UUID  `json:"id"`
 	OrganizationID  uuid.UUID  `json:"organization_id"`
+	Slug            string     `json:"slug"`
 	Name            string     `json:"name"`
 	Email           string     `json:"email"`
 	Signature       string     `json:"signature"`
@@ -220,6 +222,7 @@ type Mailbox struct {
 	PurgeAfter    *time.Time `json:"purge_after,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
 
+	autoReply       AutoReply
 	imapPasswordEnc string
 	smtpPasswordEnc string
 	lastUID         uint32
@@ -235,12 +238,61 @@ type FolderCounts struct {
 	Pending    int `json:"pending"`
 	Closed     int `json:"closed"`
 	Spam       int `json:"spam"`
+	Starred    int `json:"starred"`
+	Trash      int `json:"trash"`
 }
 
-// MailboxWithCounts is a mailbox in the sidebar.
-type MailboxWithCounts struct {
+// MailboxSummary is what every user with access sees of a mailbox: no
+// server settings, usernames or fetch errors.
+type MailboxSummary struct {
+	ID             uuid.UUID     `json:"id"`
+	OrganizationID uuid.UUID     `json:"organization_id"`
+	Slug           string        `json:"slug"`
+	Name           string        `json:"name"`
+	Email          string        `json:"email"`
+	Connector      string        `json:"connector"`
+	Signature      string        `json:"signature"`
+	AutoReply      AutoReply     `json:"auto_reply"`
+	Access         MailboxRights `json:"access"`
+	Counts         FolderCounts  `json:"counts"`
+}
+
+// MailboxAdminView adds the configuration Desk admins manage.
+type MailboxAdminView struct {
 	Mailbox
-	Counts FolderCounts `json:"counts"`
+	AutoReply AutoReply     `json:"auto_reply"`
+	Access    MailboxRights `json:"access"`
+	Counts    FolderCounts  `json:"counts"`
+	// Roles are the catalog keys and groups that grant access to it.
+	Roles []MailboxRole `json:"roles"`
+}
+
+// MailboxRole is one of a mailbox's three roles.
+type MailboxRole struct {
+	Key   string `json:"key"`
+	Group string `json:"group"`
+	Level string `json:"level"`
+}
+
+// RolesOf lists the role keys and groups of a mailbox.
+func RolesOf(slug string) []MailboxRole {
+	out := []MailboxRole{}
+	for _, l := range domain.MailboxLevels() {
+		out = append(out, MailboxRole{Key: domain.MailboxRoleKey(slug, l), Group: domain.MailboxGroup(slug, l), Level: string(l)})
+	}
+	return out
+}
+
+// View is the caller's view of a mailbox: the full configuration for Desk
+// admins, the summary for everyone else.
+func (s *Service) View(a Access, mb Mailbox, counts FolderCounts) any {
+	if a.IsAdmin(mb.OrganizationID) {
+		return MailboxAdminView{Mailbox: mb, AutoReply: mb.autoReply, Access: a.Rights(mb), Counts: counts, Roles: RolesOf(mb.Slug)}
+	}
+	return MailboxSummary{
+		ID: mb.ID, OrganizationID: mb.OrganizationID, Slug: mb.Slug, Name: mb.Name, Email: mb.Email,
+		Connector: mb.Connector, Signature: mb.Signature, AutoReply: mb.autoReply, Access: a.Rights(mb), Counts: counts,
+	}
 }
 
 const mailboxCols = `id, organization_id, name, email::text, signature,
@@ -248,7 +300,8 @@ const mailboxCols = `id, organization_id, name, email::text, signature,
 	smtp_host, smtp_port, smtp_security, smtp_username, smtp_password_enc,
 	imap_move_to, last_fetch_at, last_fetch_error, fetch_failures, next_fetch_at,
 	connector, provider_state, provider_error, deleted_at, purge_after,
-	created_at, last_uid, uid_validity`
+	created_at, last_uid, uid_validity, slug,
+	auto_reply_enabled, auto_reply_subject, auto_reply_html, auto_reply_text`
 
 func scanMailbox(row pgx.Row) (Mailbox, error) {
 	var m Mailbox
@@ -258,7 +311,8 @@ func scanMailbox(row pgx.Row) (Mailbox, error) {
 		&m.SMTPHost, &m.SMTPPort, &m.SMTPSecurity, &m.SMTPUsername, &m.smtpPasswordEnc,
 		&m.IMAPMoveTo, &m.LastFetchAt, &m.LastFetchError, &m.FetchFailures, &m.NextFetchAt,
 		&m.Connector, &m.ProviderState, &m.ProviderError, &m.DeletedAt, &m.PurgeAfter,
-		&m.CreatedAt, &lastUID, &uidValidity)
+		&m.CreatedAt, &lastUID, &uidValidity, &m.Slug,
+		&m.autoReply.Enabled, &m.autoReply.Subject, &m.autoReply.BodyHTML, &m.autoReply.BodyText)
 	m.IMAPPasswordSet = m.imapPasswordEnc != ""
 	m.SMTPPasswordSet = m.smtpPasswordEnc != ""
 	m.lastUID = uint32(lastUID)
@@ -275,44 +329,65 @@ func (s *Service) GetMailbox(ctx context.Context, id uuid.UUID) (Mailbox, error)
 	return m, err
 }
 
-// ListMailboxes returns every mailbox with folder counts for userID.
-func (s *Service) ListMailboxes(ctx context.Context, userID uuid.UUID) ([]MailboxWithCounts, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+mailboxCols+` FROM mailboxes WHERE deleted_at IS NULL ORDER BY name`)
+// ListMailboxes returns the caller's mailboxes with folder counts, counted
+// in one query.
+func (s *Service) ListMailboxes(ctx context.Context, a Access) ([]any, error) {
+	boxes, err := s.VisibleMailboxes(ctx, a)
 	if err != nil {
 		return nil, err
 	}
-	var boxes []Mailbox
-	for rows.Next() {
-		m, err := scanMailbox(rows)
-		if err != nil {
-			rows.Close()
-			return nil, err
-		}
-		boxes = append(boxes, m)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	counts, err := s.folderCounts(ctx, boxes, a.UserID)
+	if err != nil {
 		return nil, err
 	}
-
-	out := make([]MailboxWithCounts, 0, len(boxes))
+	out := make([]any, 0, len(boxes))
 	for _, m := range boxes {
-		var c FolderCounts
-		err := s.pool.QueryRow(ctx, `
-			SELECT count(*) FILTER (WHERE status = 'active' AND assignee_id IS NULL),
-			       count(*) FILTER (WHERE status IN ('active', 'pending') AND assignee_id = $2),
-			       count(*) FILTER (WHERE status IN ('active', 'pending') AND assignee_id IS NOT NULL),
-			       count(*) FILTER (WHERE status = 'pending'),
-			       count(*) FILTER (WHERE status = 'closed'),
-			       count(*) FILTER (WHERE status = 'spam')
-			  FROM conversations WHERE mailbox_id = $1
-		`, m.ID, userID).Scan(&c.Unassigned, &c.Mine, &c.Assigned, &c.Pending, &c.Closed, &c.Spam)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, MailboxWithCounts{Mailbox: m, Counts: c})
+		out = append(out, s.View(a, m, counts[m.ID]))
 	}
 	return out, nil
+}
+
+func (s *Service) folderCounts(ctx context.Context, boxes []Mailbox, userID uuid.UUID) (map[uuid.UUID]FolderCounts, error) {
+	out := map[uuid.UUID]FolderCounts{}
+	if len(boxes) == 0 {
+		return out, nil
+	}
+	ids := make([]uuid.UUID, 0, len(boxes))
+	for _, m := range boxes {
+		ids = append(ids, m.ID)
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT c.mailbox_id,
+		       count(*) FILTER (WHERE c.deleted_at IS NULL AND c.status = 'active' AND c.assignee_id IS NULL),
+		       count(*) FILTER (WHERE c.deleted_at IS NULL AND c.status IN ('active', 'pending') AND c.assignee_id = $2),
+		       count(*) FILTER (WHERE c.deleted_at IS NULL AND c.status IN ('active', 'pending') AND c.assignee_id IS NOT NULL),
+		       count(*) FILTER (WHERE c.deleted_at IS NULL AND c.status = 'pending'),
+		       count(*) FILTER (WHERE c.deleted_at IS NULL AND c.status = 'closed'),
+		       count(*) FILTER (WHERE c.deleted_at IS NULL AND c.status = 'spam'),
+		       count(*) FILTER (WHERE c.deleted_at IS NULL AND EXISTS (
+		           SELECT 1 FROM conversation_stars st WHERE st.conversation_id = c.id AND st.user_id = $2)),
+		       count(*) FILTER (WHERE c.deleted_at IS NOT NULL)
+		  FROM conversations c WHERE c.mailbox_id = ANY($1)
+		 GROUP BY c.mailbox_id`, ids, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var c FolderCounts
+		if err := rows.Scan(&id, &c.Unassigned, &c.Mine, &c.Assigned, &c.Pending, &c.Closed, &c.Spam, &c.Starred, &c.Trash); err != nil {
+			return nil, err
+		}
+		out[id] = c
+	}
+	return out, rows.Err()
+}
+
+// MailboxCounts returns one mailbox's folder counts.
+func (s *Service) MailboxCounts(ctx context.Context, mb Mailbox, userID uuid.UUID) (FolderCounts, error) {
+	m, err := s.folderCounts(ctx, []Mailbox{mb}, userID)
+	return m[mb.ID], err
 }
 
 // MailboxInput creates or updates a mailbox. Nil fields are left unchanged
@@ -320,8 +395,12 @@ func (s *Service) ListMailboxes(ctx context.Context, userID uuid.UUID) ([]Mailbo
 type MailboxInput struct {
 	// Connector is set on create only: imap (default), google_user or
 	// google_group.
-	Connector    *string `json:"connector"`
-	Name         *string `json:"name"`
+	Connector *string `json:"connector"`
+	// Slug names the mailbox's roles (create only; default from the
+	// address' local part).
+	Slug         *string    `json:"slug"`
+	AutoReply    *AutoReply `json:"auto_reply"`
+	Name         *string    `json:"name"`
 	Email        *string `json:"email"`
 	Signature    *string `json:"signature"`
 	IMAPHost     *string `json:"imap_host"`
@@ -382,6 +461,16 @@ func (s *Service) validateMailbox(in *MailboxInput, create bool) map[string]stri
 	if in.Connector != nil && !create {
 		issues["connector"] = "cannot be changed; create a new mailbox instead"
 	}
+	if in.Slug != nil {
+		switch {
+		case !create:
+			issues["slug"] = "cannot be changed: it names the mailbox's roles and groups"
+		case !domain.ValidSlug(strings.TrimSpace(*in.Slug)):
+			issues["slug"] = "lower-case letters, digits and dashes, 1 to 40 characters"
+		}
+	} else if create && in.Email != nil && !domain.ValidSlug(domain.SlugFromEmail(*in.Email)) {
+		issues["slug"] = "cannot be derived from the address; set one"
+	}
 	connector := ConnectorIMAP
 	if in.Connector != nil {
 		connector = *in.Connector
@@ -441,17 +530,38 @@ func (s *Service) CreateMailbox(ctx context.Context, orgID uuid.UUID, in Mailbox
 	if in.Connector != nil && *in.Connector != ConnectorIMAP {
 		connector, state = *in.Connector, "provisioning"
 	}
+	email := strings.ToLower(strings.TrimSpace(*in.Email))
+	slug, derived := domain.SlugFromEmail(email), true
+	if in.Slug != nil {
+		slug, derived = strings.TrimSpace(*in.Slug), false
+	}
 	var id uuid.UUID
-	err = tx.QueryRow(ctx, `
-		INSERT INTO mailboxes (organization_id, name, email, connector, provider_state) VALUES ($1, $2, $3, $4, $5) RETURNING id
-	`, orgID, strings.TrimSpace(*in.Name), strings.ToLower(strings.TrimSpace(*in.Email)), connector, state).Scan(&id)
+	for attempt := 1; ; attempt++ {
+		candidate := slug
+		if attempt > 1 {
+			candidate = fmt.Sprintf("%s-%d", slug, attempt)
+		}
+		err = pgx.BeginFunc(ctx, tx, func(sp pgx.Tx) error {
+			return sp.QueryRow(ctx, `
+				INSERT INTO mailboxes (organization_id, name, email, connector, provider_state, slug)
+				VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+				orgID, strings.TrimSpace(*in.Name), email, connector, state, candidate).Scan(&id)
+		})
+		if err != nil && isUniqueViolation(err) && strings.Contains(err.Error(), "slug") && derived && attempt < 20 {
+			continue
+		}
+		break
+	}
 	if err != nil {
-		if isUniqueViolation(err) {
+		switch {
+		case isUniqueViolation(err) && strings.Contains(err.Error(), "slug"):
+			return Mailbox{}, httperror.Validation("slug taken", map[string]string{"slug": "another mailbox already uses this slug"})
+		case isUniqueViolation(err):
 			return Mailbox{}, httperror.Conflict("a mailbox with this email address already exists (also in Desk's trash)")
 		}
 		return Mailbox{}, err
 	}
-	in.Name, in.Email, in.Connector = nil, nil, nil
+	in.Name, in.Email, in.Connector, in.Slug = nil, nil, nil, nil
 	if err := s.applyMailboxInput(ctx, tx, Mailbox{ID: id}, in); err != nil {
 		return Mailbox{}, err
 	}
@@ -509,6 +619,9 @@ func (s *Service) UpdateMailbox(ctx context.Context, id uuid.UUID, in MailboxInp
 
 func (s *Service) applyMailboxInput(ctx context.Context, tx pgx.Tx, cur Mailbox, in MailboxInput) error {
 	id := cur.ID
+	if err := applyAutoReply(ctx, tx, id, in.AutoReply); err != nil {
+		return err
+	}
 	sets := []string{}
 	args := []any{id}
 	add := func(col string, v any) {
@@ -606,9 +719,22 @@ type Person struct {
 	Email       string    `json:"email"`
 }
 
-// ListPeople returns everyone who has signed in to Desk (assignable agents).
-func (s *Service) ListPeople(ctx context.Context) ([]Person, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, display_name, COALESCE(email, '') FROM users ORDER BY display_name`)
+// maxPeople bounds the assignee picker; type to narrow it down.
+const maxPeople = 100
+
+// ListPeople returns people who have signed in to Desk, matching q (name
+// or email) when set. With a mailbox, only those who may work it (its
+// managers, as of their last sign-in, and Desk admins).
+func (s *Service) ListPeople(ctx context.Context, mb *Mailbox, q string) ([]Person, error) {
+	var group string
+	if mb != nil {
+		group = domain.MailboxGroup(mb.Slug, domain.LevelManager)
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, display_name, COALESCE(email, '') FROM users
+		 WHERE ($1 = '' OR desk_admin OR $1 = ANY(groups))
+		   AND ($2 = '' OR display_name ILIKE '%' || $2 || '%' OR email ILIKE '%' || $2 || '%')
+		 ORDER BY display_name LIMIT $3`, group, strings.TrimSpace(q), maxPeople)
 	if err != nil {
 		return nil, err
 	}
@@ -622,13 +748,6 @@ func (s *Service) ListPeople(ctx context.Context) ([]Person, error) {
 		out = append(out, p)
 	}
 	return out, rows.Err()
-}
-
-// DefaultOrganization returns the first organization (single-org slice).
-func (s *Service) DefaultOrganization(ctx context.Context) (uuid.UUID, error) {
-	var id uuid.UUID
-	err := s.pool.QueryRow(ctx, `SELECT id FROM organizations ORDER BY slug LIMIT 1`).Scan(&id)
-	return id, err
 }
 
 func isUniqueViolation(err error) bool {

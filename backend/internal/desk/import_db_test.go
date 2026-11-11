@@ -46,7 +46,7 @@ func TestImportStoresFilesInObjectStorage(t *testing.T) {
 		t.Fatalf("expected attachment and raw message in storage, got %v", blobs.Keys())
 	}
 	c, _ := svc.GetConversation(ctx, res.ConversationID)
-	d, err := svc.Detail(ctx, c, uuid.Nil)
+	d, err := svc.Detail(ctx, NewAccess(uuid.Nil, nil, []uuid.UUID{mb.OrganizationID}), c, mb)
 	if err != nil {
 		t.Fatal(err)
 	}

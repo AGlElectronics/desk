@@ -10,6 +10,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/AGlElectronics/desk/backend/internal/domain"
 )
 
 // Resolver turns an authenticated external identity (OIDC claims, or a dev
@@ -51,16 +53,41 @@ func (r *Resolver) LoadOrProvisionDevUser(ctx context.Context, name string, grou
 	display := displayFromDevHeader(name)
 	email := name + "@desk.local"
 
-	userID, err := r.upsertUser(ctx, "dev", name, display, &email)
-	if err != nil {
-		return nil, fmt.Errorf("provision dev user: %w", err)
-	}
-
 	memberships, err := r.groupMemberships(ctx, groups)
 	if err != nil {
 		return nil, fmt.Errorf("resolve dev group bindings: %w", err)
 	}
-	return r.buildUser(userID, "dev", name, display, email, memberships), nil
+	norm := NormalizeGroups(groups)
+	userID, err := r.upsertUser(ctx, "dev", name, display, &email, norm, r.isAdmin(memberships))
+	if err != nil {
+		return nil, fmt.Errorf("provision dev user: %w", err)
+	}
+	u := r.buildUser(userID, "dev", name, display, email, memberships)
+	u.Groups = norm
+	return u, nil
+}
+
+// isAdmin: holds mailbox.manage through any membership (Desk admin).
+func (r *Resolver) isAdmin(memberships []Membership) bool {
+	for _, m := range memberships {
+		if _, ok := r.access.PermissionsForRole(m.Role)[domain.PermMailboxManage]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// NormalizeGroups lower-cases groups and drops Keycloak's leading "/".
+func NormalizeGroups(groups []string) []string {
+	out := make([]string, 0, len(groups))
+	seen := map[string]bool{}
+	for _, g := range groups {
+		if n := normalizeGroup(g); n != "" && !seen[n] {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // LoadOrProvisionOIDCUser is called by the OIDC middleware after a
@@ -76,42 +103,50 @@ func (r *Resolver) LoadOrProvisionOIDCUser(ctx context.Context, claims *OIDCClai
 	if e := strings.TrimSpace(claims.Email); e != "" {
 		emailPtr = &e
 	}
-	userID, err := r.upsertUser(ctx, claims.Issuer, claims.Subject, display, emailPtr)
-	if err != nil {
-		return nil, fmt.Errorf("upsert oidc user: %w", err)
-	}
-
 	memberships, err := r.groupMemberships(ctx, claims.Groups)
 	if err != nil {
 		return nil, fmt.Errorf("resolve group bindings: %w", err)
+	}
+	norm := NormalizeGroups(claims.Groups)
+	userID, err := r.upsertUser(ctx, claims.Issuer, claims.Subject, display, emailPtr, norm, r.isAdmin(memberships))
+	if err != nil {
+		return nil, fmt.Errorf("upsert oidc user: %w", err)
 	}
 
 	email := ""
 	if emailPtr != nil {
 		email = *emailPtr
 	}
-	return r.buildUser(userID, claims.Issuer, claims.Subject, display, email, memberships), nil
+	u := r.buildUser(userID, claims.Issuer, claims.Subject, display, email, memberships)
+	u.Groups = norm
+	return u, nil
 }
 
 // upsertUser looks up the local user by (issuer, subject). If absent, a
 // fresh users row is created. Metadata (display_name, email, last_login_at)
-// is refreshed on every call.
+// is refreshed on every call, and so are the groups and the Desk admin
+// flag, which background jobs (purge reminders, notifications) read. They
+// never grant anything to a request: authorization always uses the token.
 func (r *Resolver) upsertUser(
 	ctx context.Context,
 	issuer, subject, display string,
 	email *string,
+	groups []string,
+	admin bool,
 ) (uuid.UUID, error) {
 	var userID uuid.UUID
 	err := r.pool.QueryRow(ctx,
-		`INSERT INTO users (issuer, subject, display_name, email, last_login_at)
-		 VALUES ($1, $2, $3, $4, now())
+		`INSERT INTO users (issuer, subject, display_name, email, last_login_at, groups, desk_admin)
+		 VALUES ($1, $2, $3, $4, now(), $5, $6)
 		 ON CONFLICT (issuer, subject) DO UPDATE
 		    SET display_name  = EXCLUDED.display_name,
 		        email         = COALESCE(EXCLUDED.email, users.email),
 		        last_login_at = now(),
+		        groups        = EXCLUDED.groups,
+		        desk_admin    = EXCLUDED.desk_admin,
 		        updated_at    = now()
 		 RETURNING id`,
-		issuer, subject, display, email,
+		issuer, subject, display, email, groups, admin,
 	).Scan(&userID)
 	if err != nil {
 		return uuid.Nil, err

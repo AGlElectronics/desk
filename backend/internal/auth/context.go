@@ -32,6 +32,9 @@ type User struct {
 	Email       string
 	DisplayName string
 	Memberships []Membership
+	// Groups are the token's IdP groups, normalized (lower case, no
+	// leading "/"). Per-mailbox roles are read from them.
+	Groups []string
 
 	// Permissions holds the union of every role's permissions across every
 	// membership; useful for coarse "is this feature visible?" checks.

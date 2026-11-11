@@ -139,6 +139,34 @@ func (s *Service) ingestProvider(ctx context.Context, mb Mailbox, raw []byte, pr
 	return s.ingest(ctx, mb, raw, "gmail:"+providerID, providerID, log)
 }
 
+// Integrations is what the settings page shows about mail providers and
+// notifications.
+type Integrations struct {
+	Google *GoogleInfo `json:"google"`
+	// Notifications: Desk can send its own emails (NOTIFY_FROM set and a
+	// way to send them).
+	Notifications bool   `json:"notifications"`
+	NotifyFrom    string `json:"notify_from"`
+	ModuleSMTP    bool   `json:"module_smtp"`
+}
+
+// GoogleInfo describes the Google Workspace connector.
+type GoogleInfo struct {
+	Domain        string       `json:"domain"`
+	SharedMailbox string       `json:"shared_mailbox"`
+	Label         string       `json:"label"`
+	Shared        SharedStatus `json:"shared_status"`
+}
+
+// Integrations reports the configured connectors.
+func (s *Service) Integrations(ctx context.Context) Integrations {
+	out := Integrations{Notifications: s.NotificationsEnabled(), NotifyFrom: s.notifyFrom, ModuleSMTP: s.smtp.Host != ""}
+	if s.google != nil {
+		out.Google = &GoogleInfo{Domain: s.google.Domain, SharedMailbox: s.google.SharedMailbox, Label: s.google.Label, Shared: s.sharedStatus(ctx)}
+	}
+	return out
+}
+
 // SharedStatus is the state of the shared account's polling.
 type SharedStatus struct {
 	LastFetchAt *time.Time `json:"last_fetch_at,omitempty"`

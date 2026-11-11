@@ -447,6 +447,24 @@ func (s *Service) importTx(ctx context.Context, mb Mailbox, p *ParsedMessage, th
 	if err := attach(tx); err != nil {
 		return ImportResult{}, err
 	}
+	if res.Created {
+		var number int
+		if err := tx.QueryRow(ctx, `SELECT number FROM conversations WHERE id = $1`, convID).Scan(&number); err != nil {
+			return ImportResult{}, err
+		}
+		reply, err := shouldAutoReply(ctx, tx, mb, p)
+		if err != nil {
+			return ImportResult{}, err
+		}
+		if reply {
+			if err := queueAutoReply(ctx, tx, mb, convID, p.FromEmail); err != nil {
+				return ImportResult{}, err
+			}
+		}
+		if err := s.notifyNewConversation(ctx, tx, mb, convID, number, p.Subject, p.FromEmail); err != nil {
+			return ImportResult{}, err
+		}
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO message_ids (message_id, conversation_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
 		p.MessageID, convID); err != nil {
 		return ImportResult{}, err
@@ -468,7 +486,7 @@ func findConversation(ctx context.Context, tx pgx.Tx, mailboxID uuid.UUID, p *Pa
 		var id uuid.UUID
 		err := tx.QueryRow(ctx, `
 			SELECT m.conversation_id FROM message_ids m JOIN conversations c ON c.id = m.conversation_id
-			 WHERE m.message_id = ANY($1) AND c.mailbox_id = $2 LIMIT 1`, p.References, mailboxID).Scan(&id)
+			 WHERE m.message_id = ANY($1) AND c.mailbox_id = $2 AND c.deleted_at IS NULL LIMIT 1`, p.References, mailboxID).Scan(&id)
 		if err == nil {
 			return id, nil
 		}
@@ -480,8 +498,10 @@ func findConversation(ctx context.Context, tx pgx.Tx, mailboxID uuid.UUID, p *Pa
 		n, _ := strconv.Atoi(m[1])
 		var id uuid.UUID
 		err := tx.QueryRow(ctx, `
-			SELECT c.id FROM conversations c JOIN customers cu ON cu.id = c.customer_id
-			 WHERE c.mailbox_id = $1 AND c.number = $2 AND cu.email = $3`, mailboxID, n, p.FromEmail).Scan(&id)
+			SELECT c.id FROM conversations c
+			 WHERE c.mailbox_id = $1 AND c.number = $2 AND c.deleted_at IS NULL
+			   AND EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = c.customer_id AND ce.email = $3)`,
+			mailboxID, n, p.FromEmail).Scan(&id)
 		if err == nil {
 			return id, nil
 		}

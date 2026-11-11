@@ -1,20 +1,26 @@
 # Desk access configuration.
 #
-# This TOML file is the single source of truth for the role → permission
-# catalog and the OIDC-group → role bindings. It is read once at startup;
-# restart the backend after editing.
+# This TOML file holds the module-wide roles and their OIDC-group bindings.
+# It is read once at startup; restart the backend after editing.
+#
+# Access to mailboxes is NOT configured here: every mailbox publishes three
+# roles in Desk's role catalog, granted by Keycloak groups that HR manages
+# (docs: modules/desk/access):
+#
+#   desk-<slug>-viewer   read the mailbox's conversations
+#   desk-<slug>-manager  reply, note, assign, close, tags, saved replies,
+#                        signature and auto-reply
+#   desk-<slug>-delete   delete and restore emails and conversations
 #
 # Permission reference — add new names in internal/domain/domain.go,
 # otherwise the loader rejects them.
 #
-#   Tickets:    tickets.work    (read and work conversations in every mailbox)
-#   Mailboxes:  mailbox.manage  (create/edit mailboxes, IMAP/SMTP settings)
-#   Settings:   settings.manage (Den pairing, module settings)
+#   mailbox.manage   Desk admin: create, configure, delete and purge
+#                    mailboxes; full access to every mailbox of the
+#                    organization; retention settings and audit log
+#   settings.manage  Den pairing and module settings
 #
 # A role listed here replaces its built-in permission set entirely.
-#
-# MVP: agents see every mailbox. Per-mailbox grants come later
-# (docs/plan.md, "Access model").
 
 # Organization (slug) that bindings grant roles in, unless a binding sets
 # its own `organization`.
@@ -25,17 +31,10 @@ organization = "demo-org"
 # -------------------------------------------------------------------------
 
 [roles.organization_admin]
-description = "Manages mailboxes, every conversation and the module settings."
+description = "Desk admin: creates, configures and deletes mailboxes; full access to every mailbox (read, answer, delete, email any address from them); retention, audit log and module settings."
 permissions = [
-  "tickets.work",
   "mailbox.manage",
   "settings.manage",
-]
-
-[roles.agent]
-description = "Answers support conversations: reply, note, assign, close."
-permissions = [
-  "tickets.work",
 ]
 
 # -------------------------------------------------------------------------
@@ -46,7 +45,3 @@ permissions = [
 [[bindings]]
 group = "desk-admin"
 role = "organization_admin"
-
-[[bindings]]
-group = "desk-agent"
-role = "agent"

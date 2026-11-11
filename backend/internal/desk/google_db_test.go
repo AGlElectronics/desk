@@ -182,7 +182,7 @@ func TestMailboxTrashRestorePurge(t *testing.T) {
 	if suspended, _ := e.fake.Suspended("lost@example.org"); !suspended {
 		t.Fatal("Google mailbox not suspended")
 	}
-	list, _ := e.svc.ListMailboxes(ctx, e.anna.ID)
+	list, _ := e.svc.ListMailboxes(ctx, NewAccess(e.anna.ID, nil, []uuid.UUID{e.org}))
 	if len(list) != 0 {
 		t.Fatal("trashed mailboxes leave the sidebar")
 	}

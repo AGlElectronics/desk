@@ -40,6 +40,11 @@ func (s *Service) audit(ctx context.Context, actor *Person, action string, mailb
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, actorID, name, action, mailboxID, targetType, targetID, summary, raw)
 }
 
+// Audit records an action taken through the API.
+func (s *Service) Audit(ctx context.Context, actor *Person, action string, mailboxID *uuid.UUID, targetType, targetID, summary string, details any) {
+	s.audit(ctx, actor, action, mailboxID, targetType, targetID, summary, details)
+}
+
 // AuditFilter narrows the audit log.
 type AuditFilter struct {
 	MailboxID *uuid.UUID

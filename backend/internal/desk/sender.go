@@ -194,6 +194,9 @@ func (s *Service) sendReply(ctx context.Context, threadID uuid.UUID, log zerolog
 		if kind == "auto_reply" {
 			out.FromName = mb.Name
 			out.Extra = map[string]string{"Auto-Submitted": "auto-replied", "X-Auto-Response-Suppress": "All"}
+			if mb.autoReply.Subject != "" {
+				out.Subject = replySubject(mb.autoReply.Subject, c.Number, false)
+			}
 		}
 	}
 	raw, err := buildMessage(out)

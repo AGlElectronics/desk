@@ -2,12 +2,12 @@ package desk
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"html"
 	"io"
-	"net/mail"
-	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +22,16 @@ import (
 // undoWindow is how long a reply waits in the queue before it is sent, so
 // "Undo" can still take it back.
 const undoWindow = 10 * time.Second
+
+const (
+	// defaultPageSize and maxPageSize bound the conversation list.
+	defaultPageSize = 50
+	maxPageSize     = 100
+	// maxThreads bounds the threads returned with a conversation (newest).
+	maxThreads = 500
+	// maxTags per conversation.
+	maxTags = 20
+)
 
 // Customer is the person on the other side of a conversation.
 type Customer struct {
@@ -44,9 +54,12 @@ type Conversation struct {
 	AssigneeID     *uuid.UUID `json:"assignee_id,omitempty"`
 	AssigneeName   string     `json:"assignee_name,omitempty"`
 	ThreadCount    int        `json:"thread_count"`
+	Tags           []string   `json:"tags"`
+	Starred        bool       `json:"starred"`
 	LastActivityAt time.Time  `json:"last_activity_at"`
 	CreatedAt      time.Time  `json:"created_at"`
 	ClosedAt       *time.Time `json:"closed_at,omitempty"`
+	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
 }
 
 // AttachmentMeta describes one attachment (content is downloaded separately).
@@ -74,6 +87,8 @@ type Thread struct {
 	SendStatus    *string          `json:"send_status,omitempty"`
 	SendError     string           `json:"send_error,omitempty"`
 	NextAttemptAt *time.Time       `json:"next_attempt_at,omitempty"`
+	AutoSubmitted bool             `json:"auto_submitted"`
+	DeletedAt     *time.Time       `json:"deleted_at,omitempty"`
 	Attachments   []AttachmentMeta `json:"attachments"`
 	CreatedAt     time.Time        `json:"created_at"`
 }
@@ -89,17 +104,23 @@ type Viewer struct {
 type ConversationDetail struct {
 	Conversation
 	Threads []Thread `json:"threads"`
+	// ThreadsTruncated: only the newest maxThreads threads are included.
+	ThreadsTruncated bool `json:"threads_truncated"`
 	// History is the customer's other conversations, newest first.
 	History []Conversation `json:"history"`
 	Viewers []Viewer       `json:"viewers"`
+	Access  MailboxRights  `json:"access"`
 }
 
+// convSelect: $1 is always the viewer's user id (for "starred").
 const convSelect = `
 	SELECT c.id, c.mailbox_id, m.name, c.number, c.subject, c.status, c.preview,
 	       cu.id, cu.email::text, cu.name, cu.notes,
 	       c.assignee_id, COALESCE(u.display_name, ''),
-	       (SELECT count(*) FROM threads t WHERE t.conversation_id = c.id AND t.kind <> 'system'),
-	       c.last_activity_at, c.created_at, c.closed_at
+	       (SELECT count(*) FROM threads t WHERE t.conversation_id = c.id AND t.kind <> 'system' AND t.deleted_at IS NULL),
+	       ARRAY(SELECT ct.tag FROM conversation_tags ct WHERE ct.conversation_id = c.id ORDER BY ct.tag),
+	       EXISTS (SELECT 1 FROM conversation_stars st WHERE st.conversation_id = c.id AND st.user_id = $1),
+	       c.last_activity_at, c.created_at, c.closed_at, c.deleted_at
 	  FROM conversations c
 	  JOIN mailboxes m ON m.id = c.mailbox_id
 	  JOIN customers cu ON cu.id = c.customer_id
@@ -109,8 +130,11 @@ func scanConversation(row pgx.Row) (Conversation, error) {
 	var c Conversation
 	err := row.Scan(&c.ID, &c.MailboxID, &c.MailboxName, &c.Number, &c.Subject, &c.Status, &c.Preview,
 		&c.Customer.ID, &c.Customer.Email, &c.Customer.Name, &c.Customer.Notes,
-		&c.AssigneeID, &c.AssigneeName, &c.ThreadCount,
-		&c.LastActivityAt, &c.CreatedAt, &c.ClosedAt)
+		&c.AssigneeID, &c.AssigneeName, &c.ThreadCount, &c.Tags, &c.Starred,
+		&c.LastActivityAt, &c.CreatedAt, &c.ClosedAt, &c.DeletedAt)
+	if c.Tags == nil {
+		c.Tags = []string{}
+	}
 	return c, err
 }
 
@@ -133,59 +157,133 @@ func (s *Service) queryConversations(ctx context.Context, where string, args ...
 
 // ListFilter selects conversations for the list view.
 type ListFilter struct {
+	// MailboxIDs are the mailboxes the caller may view (required).
+	MailboxIDs []uuid.UUID
+	// MailboxID narrows to one of them; nil searches all of them.
 	MailboxID *uuid.UUID
-	// Folder: unassigned | mine | assigned | pending | closed | spam | all.
+	// Folder: unassigned | mine | assigned | pending | closed | spam | all |
+	// starred | trash.
 	Folder string
 	Query  string
+	Tag    string
 	UserID uuid.UUID
+	// Cursor continues after the last conversation of the previous page.
+	Cursor string
+	Limit  int
 }
 
-// ListConversations returns up to 200 conversations, newest activity first.
-func (s *Service) ListConversations(ctx context.Context, f ListFilter) ([]Conversation, error) {
-	conds := []string{"TRUE"}
-	args := []any{}
+// ListPage is one page of conversations.
+type ListPage struct {
+	Conversations []Conversation `json:"conversations"`
+	// NextCursor is "" on the last page.
+	NextCursor string `json:"next_cursor"`
+}
+
+func encodeCursor(c Conversation) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(c.LastActivityAt.UnixMicro(), 10) + "|" + c.ID.String()))
+}
+
+func decodeCursor(s string) (time.Time, uuid.UUID, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return time.Time{}, uuid.Nil, err
+	}
+	ts, id, ok := strings.Cut(string(raw), "|")
+	if !ok {
+		return time.Time{}, uuid.Nil, errors.New("bad cursor")
+	}
+	micros, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return time.Time{}, uuid.Nil, err
+	}
+	u, err := uuid.Parse(id)
+	return time.UnixMicro(micros), u, err
+}
+
+// ListConversations returns one page, newest activity first. A query
+// searches subjects and message text (full-text), customer names and
+// addresses, and "#123" numbers, across every visible mailbox unless one
+// is chosen.
+func (s *Service) ListConversations(ctx context.Context, f ListFilter) (ListPage, error) {
+	args := []any{f.UserID}
 	arg := func(v any) string {
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
 	}
+	conds := []string{"c.mailbox_id = ANY(" + arg(f.MailboxIDs) + ")", "m.deleted_at IS NULL"}
 	if f.MailboxID != nil {
 		conds = append(conds, "c.mailbox_id = "+arg(*f.MailboxID))
 	}
+	live := "c.deleted_at IS NULL AND "
 	switch f.Folder {
 	case "", "unassigned":
-		conds = append(conds, "c.status = 'active' AND c.assignee_id IS NULL")
+		conds = append(conds, live+"c.status = 'active' AND c.assignee_id IS NULL")
 	case "mine":
-		conds = append(conds, "c.status IN ('active','pending') AND c.assignee_id = "+arg(f.UserID))
+		conds = append(conds, live+"c.status IN ('active','pending') AND c.assignee_id = $1")
 	case "assigned":
-		conds = append(conds, "c.status IN ('active','pending') AND c.assignee_id IS NOT NULL")
-	case "pending":
-		conds = append(conds, "c.status = 'pending'")
-	case "closed":
-		conds = append(conds, "c.status = 'closed'")
-	case "spam":
-		conds = append(conds, "c.status = 'spam'")
+		conds = append(conds, live+"c.status IN ('active','pending') AND c.assignee_id IS NOT NULL")
+	case "pending", "closed", "spam":
+		conds = append(conds, live+"c.status = "+arg(f.Folder))
 	case "all":
-		conds = append(conds, "c.status <> 'spam'")
+		conds = append(conds, live+"c.status <> 'spam'")
+	case "starred":
+		conds = append(conds, live+"EXISTS (SELECT 1 FROM conversation_stars st WHERE st.conversation_id = c.id AND st.user_id = $1)")
+	case "trash":
+		conds = append(conds, "c.deleted_at IS NOT NULL")
 	default:
-		return nil, httperror.BadRequest("unknown folder: " + f.Folder)
+		return ListPage{}, httperror.BadRequest("unknown folder: " + f.Folder)
+	}
+	if t := strings.ToLower(strings.TrimSpace(f.Tag)); t != "" {
+		conds = append(conds, "EXISTS (SELECT 1 FROM conversation_tags ct WHERE ct.conversation_id = c.id AND ct.tag = "+arg(t)+")")
 	}
 	if q := strings.TrimSpace(f.Query); q != "" {
-		like := arg("%" + q + "%")
 		num := strings.TrimPrefix(q, "#")
-		numCond := "FALSE"
-		var n int
-		if _, err := fmt.Sscanf(num, "%d", &n); err == nil && fmt.Sprint(n) == num {
-			numCond = "c.number = " + arg(n)
+		if n, err := strconv.Atoi(num); err == nil && strconv.Itoa(n) == num {
+			conds = append(conds, "c.number = "+arg(n))
+		} else {
+			like := arg("%" + escapeLike(q) + "%")
+			tsq := "websearch_to_tsquery('simple', " + arg(q) + ")"
+			conds = append(conds, fmt.Sprintf(`(c.search @@ %[2]s OR c.subject ILIKE %[1]s OR cu.name ILIKE %[1]s
+				OR EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = cu.id AND ce.email ILIKE %[1]s)
+				OR EXISTS (SELECT 1 FROM threads t WHERE t.conversation_id = c.id AND t.deleted_at IS NULL AND t.search @@ %[2]s))`, like, tsq))
 		}
-		conds = append(conds, fmt.Sprintf(`(c.subject ILIKE %[1]s OR cu.email ILIKE %[1]s OR cu.name ILIKE %[1]s OR %[2]s
-			OR EXISTS (SELECT 1 FROM threads t WHERE t.conversation_id = c.id AND t.body_text ILIKE %[1]s))`, like, numCond))
 	}
-	return s.queryConversations(ctx, "WHERE "+strings.Join(conds, " AND ")+" ORDER BY c.last_activity_at DESC LIMIT 200", args...)
+	if f.Cursor != "" {
+		ts, id, err := decodeCursor(f.Cursor)
+		if err != nil {
+			return ListPage{}, httperror.BadRequest("invalid cursor")
+		}
+		conds = append(conds, "(c.last_activity_at, c.id) < ("+arg(ts)+", "+arg(id)+")")
+	}
+	limit := f.Limit
+	if limit <= 0 {
+		limit = defaultPageSize
+	}
+	limit = min(limit, maxPageSize)
+	list, err := s.queryConversations(ctx, "WHERE "+strings.Join(conds, " AND ")+
+		" ORDER BY c.last_activity_at DESC, c.id DESC LIMIT "+arg(limit+1), args...)
+	if err != nil {
+		return ListPage{}, err
+	}
+	page := ListPage{Conversations: list}
+	if len(list) > limit {
+		page.Conversations = list[:limit]
+		page.NextCursor = encodeCursor(list[limit-1])
+	}
+	return page, nil
+}
+
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
 // GetConversation loads one conversation or a typed 404.
 func (s *Service) GetConversation(ctx context.Context, id uuid.UUID) (Conversation, error) {
-	c, err := scanConversation(s.pool.QueryRow(ctx, convSelect+" WHERE c.id = $1", id))
+	return s.getConversationAs(ctx, id, uuid.Nil)
+}
+
+func (s *Service) getConversationAs(ctx context.Context, id, viewer uuid.UUID) (Conversation, error) {
+	c, err := scanConversation(s.pool.QueryRow(ctx, convSelect+" WHERE c.id = $2", viewer, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Conversation{}, httperror.NotFound("conversation")
 	}
@@ -193,14 +291,22 @@ func (s *Service) GetConversation(ctx context.Context, id uuid.UUID) (Conversati
 }
 
 // Detail loads threads, attachments, customer history and other viewers.
-func (s *Service) Detail(ctx context.Context, c Conversation, viewerID uuid.UUID) (ConversationDetail, error) {
-	d := ConversationDetail{Conversation: c, Threads: []Thread{}, Viewers: []Viewer{}}
+// Emails in Desk's trash are included only for callers who may restore
+// them.
+func (s *Service) Detail(ctx context.Context, a Access, c Conversation, mb Mailbox) (ConversationDetail, error) {
+	if fresh, err := s.getConversationAs(ctx, c.ID, a.UserID); err == nil {
+		c = fresh
+	}
+	d := ConversationDetail{Conversation: c, Threads: []Thread{}, Viewers: []Viewer{}, Access: a.Rights(mb)}
+	showDeleted := a.CanDelete(mb) || c.DeletedAt != nil
 	rows, err := s.pool.Query(ctx, `
-		SELECT t.id, t.kind, t.author_id, COALESCE(u.display_name, ''), t.from_email, t.to_emails, t.cc_emails,
-		       t.body_html, t.body_text, t.send_status, t.send_error, t.next_attempt_at, t.created_at
-		  FROM threads t LEFT JOIN users u ON u.id = t.author_id
-		 WHERE t.conversation_id = $1
-		 ORDER BY t.created_at, t.id`, c.ID)
+		SELECT * FROM (
+		  SELECT t.id, t.kind, t.author_id, COALESCE(u.display_name, ''), t.from_email, t.to_emails, t.cc_emails,
+		         t.body_html, t.body_text, t.send_status, t.send_error, t.next_attempt_at, t.auto_submitted, t.deleted_at, t.created_at
+		    FROM threads t LEFT JOIN users u ON u.id = t.author_id
+		   WHERE t.conversation_id = $1 AND ($2 OR t.deleted_at IS NULL)
+		   ORDER BY t.created_at DESC, t.id DESC LIMIT $3) newest
+		 ORDER BY created_at, id`, c.ID, showDeleted, maxThreads+1)
 	if err != nil {
 		return d, err
 	}
@@ -208,41 +314,57 @@ func (s *Service) Detail(ctx context.Context, c Conversation, viewerID uuid.UUID
 	for rows.Next() {
 		var t Thread
 		if err := rows.Scan(&t.ID, &t.Kind, &t.AuthorID, &t.AuthorName, &t.FromEmail, &t.To, &t.CC,
-			&t.BodyHTML, &t.BodyText, &t.SendStatus, &t.SendError, &t.NextAttemptAt, &t.CreatedAt); err != nil {
+			&t.BodyHTML, &t.BodyText, &t.SendStatus, &t.SendError, &t.NextAttemptAt, &t.AutoSubmitted, &t.DeletedAt, &t.CreatedAt); err != nil {
 			rows.Close()
 			return d, err
 		}
 		t.Attachments = []AttachmentMeta{}
-		index[t.ID] = len(d.Threads)
 		d.Threads = append(d.Threads, t)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return d, err
 	}
+	if len(d.Threads) > maxThreads {
+		d.Threads, d.ThreadsTruncated = d.Threads[1:], true
+	}
+	ids := make([]uuid.UUID, 0, len(d.Threads))
+	for i, t := range d.Threads {
+		index[t.ID] = i
+		ids = append(ids, t.ID)
+	}
 
 	rows, err = s.pool.Query(ctx, `
-		SELECT a.thread_id, a.id, a.filename, a.content_type, a.size_bytes, a.content_id, a.inline
-		  FROM attachments a JOIN threads t ON t.id = a.thread_id
-		 WHERE t.conversation_id = $1 ORDER BY a.created_at`, c.ID)
+		SELECT thread_id, id, filename, content_type, size_bytes, content_id, inline
+		  FROM attachments WHERE thread_id = ANY($1) ORDER BY created_at`, ids)
 	if err != nil {
 		return d, err
 	}
 	for rows.Next() {
 		var threadID uuid.UUID
-		var a AttachmentMeta
-		if err := rows.Scan(&threadID, &a.ID, &a.Filename, &a.ContentType, &a.SizeBytes, &a.ContentID, &a.Inline); err != nil {
+		var at AttachmentMeta
+		if err := rows.Scan(&threadID, &at.ID, &at.Filename, &at.ContentType, &at.SizeBytes, &at.ContentID, &at.Inline); err != nil {
 			rows.Close()
 			return d, err
 		}
 		if i, ok := index[threadID]; ok {
-			d.Threads[i].Attachments = append(d.Threads[i].Attachments, a)
+			d.Threads[i].Attachments = append(d.Threads[i].Attachments, at)
 		}
 	}
 	rows.Close()
 
+	// History only from mailboxes the caller may see.
+	visible, err := s.VisibleMailboxes(ctx, a)
+	if err != nil {
+		return d, err
+	}
+	vis := make([]uuid.UUID, 0, len(visible))
+	for _, m := range visible {
+		vis = append(vis, m.ID)
+	}
 	d.History, err = s.queryConversations(ctx,
-		"WHERE c.customer_id = $1 AND c.id <> $2 ORDER BY c.last_activity_at DESC LIMIT 20", c.Customer.ID, c.ID)
+		"WHERE c.customer_id = $2 AND c.id <> $3 AND c.mailbox_id = ANY($4) AND c.deleted_at IS NULL ORDER BY c.last_activity_at DESC LIMIT 20",
+		a.UserID, c.Customer.ID, c.ID, vis)
 	if err != nil {
 		return d, err
 	}
@@ -250,7 +372,7 @@ func (s *Service) Detail(ctx context.Context, c Conversation, viewerID uuid.UUID
 	rows, err = s.pool.Query(ctx, `
 		SELECT v.user_id, u.display_name, v.mode FROM viewers v JOIN users u ON u.id = v.user_id
 		 WHERE v.conversation_id = $1 AND v.user_id <> $2 AND v.seen_at > now() - interval '30 seconds'
-		 ORDER BY u.display_name`, c.ID, viewerID)
+		 ORDER BY u.display_name`, c.ID, a.UserID)
 	if err != nil {
 		return d, err
 	}
@@ -281,25 +403,27 @@ func (s *Service) Heartbeat(ctx context.Context, convID, userID uuid.UUID, mode 
 // Changes
 // ----------------------------------------------------------------------------
 
-// UpdateInput changes status and/or assignee. ClearAssignee unassigns.
+// UpdateInput changes status, assignee and/or tags. ClearAssignee unassigns.
 type UpdateInput struct {
 	Status        *string
 	AssigneeID    *uuid.UUID
 	ClearAssignee bool
+	// Tags replaces the conversation's tags.
+	Tags *[]string
 }
 
-// UpdateConversation applies status / assignee changes and records system
-// lines for them.
-func (s *Service) UpdateConversation(ctx context.Context, c Conversation, actorID uuid.UUID, in UpdateInput) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	if err := s.applyUpdate(ctx, tx, c, actorID, in); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+// UpdateConversation applies status / assignee / tag changes and records
+// system lines for them.
+func (s *Service) UpdateConversation(ctx context.Context, c Conversation, mb Mailbox, actor *Person, in UpdateInput) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := s.applyUpdate(ctx, tx, c, actor.ID, in); err != nil {
+			return err
+		}
+		if in.AssigneeID != nil && *in.AssigneeID != actor.ID && (c.AssigneeID == nil || *c.AssigneeID != *in.AssigneeID) {
+			return s.notifyAssigned(ctx, tx, mb, c, *in.AssigneeID, actor)
+		}
+		return nil
+	})
 }
 
 func (s *Service) applyUpdate(ctx context.Context, tx pgx.Tx, c Conversation, actorID uuid.UUID, in UpdateInput) error {
@@ -328,12 +452,19 @@ func (s *Service) applyUpdate(ctx context.Context, tx pgx.Tx, c Conversation, ac
 		}
 	} else if in.AssigneeID != nil && (c.AssigneeID == nil || *c.AssigneeID != *in.AssigneeID) {
 		var name string
-		err := tx.QueryRow(ctx, `SELECT display_name FROM users WHERE id = $1`, *in.AssigneeID).Scan(&name)
+		var mayWork bool
+		err := tx.QueryRow(ctx, `
+			SELECT u.display_name, u.desk_admin OR ('desk-' || m.slug || '-manager') = ANY(u.groups) OR u.id = $3
+			  FROM users u, conversations c JOIN mailboxes m ON m.id = c.mailbox_id
+			 WHERE u.id = $1 AND c.id = $2`, *in.AssigneeID, c.ID, actorID).Scan(&name, &mayWork)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return httperror.Validation("unknown assignee", map[string]string{"assignee_id": "not a Desk user"})
 		}
 		if err != nil {
 			return err
+		}
+		if !mayWork {
+			return httperror.Validation("assignee cannot work this mailbox", map[string]string{"assignee_id": "needs the manager role of this mailbox"})
 		}
 		if _, err := tx.Exec(ctx, `UPDATE conversations SET assignee_id = $2 WHERE id = $1`, c.ID, *in.AssigneeID); err != nil {
 			return err
@@ -342,313 +473,80 @@ func (s *Service) applyUpdate(ctx context.Context, tx pgx.Tx, c Conversation, ac
 			return err
 		}
 	}
+	if in.Tags != nil {
+		tags, err := cleanTags(*in.Tags)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM conversation_tags WHERE conversation_id = $1 AND NOT (tag = ANY($2))`, c.ID, tags); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO conversation_tags (conversation_id, tag) SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING`, c.ID, tags); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func systemLine(ctx context.Context, tx pgx.Tx, convID, actorID uuid.UUID, text string) error {
-	_, err := tx.Exec(ctx, `
-		INSERT INTO threads (conversation_id, kind, author_id, body_text, body_html)
-		VALUES ($1, 'system', $2, $3, $4)`, convID, actorID, text, html.EscapeString(text))
+func cleanTags(in []string) ([]string, error) {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, t := range in {
+		t = strings.ToLower(strings.Join(strings.Fields(t), " "))
+		if t == "" || seen[t] {
+			continue
+		}
+		if !tagPattern.MatchString(t) {
+			return nil, httperror.Validation("invalid tag", map[string]string{"tags": fmt.Sprintf("%q: letters, digits, spaces, - and _, at most 32 characters", t)})
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	if len(out) > maxTags {
+		return nil, httperror.Validation("too many tags", map[string]string{"tags": fmt.Sprintf("at most %d", maxTags)})
+	}
+	return out, nil
+}
+
+// Tags lists the tags used in the given mailboxes, most used first.
+func (s *Service) Tags(ctx context.Context, mailboxIDs []uuid.UUID) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT ct.tag FROM conversation_tags ct JOIN conversations c ON c.id = ct.conversation_id
+		 WHERE c.mailbox_id = ANY($1) AND c.deleted_at IS NULL GROUP BY ct.tag ORDER BY count(*) DESC, ct.tag LIMIT 200`, mailboxIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var t string
+		if rows.Scan(&t) == nil {
+			out = append(out, t)
+		}
+	}
+	return out, rows.Err()
+}
+
+// SetStar stars or unstars a conversation for userID.
+func (s *Service) SetStar(ctx context.Context, convID, userID uuid.UUID, on bool) error {
+	var err error
+	if on {
+		_, err = s.pool.Exec(ctx, `INSERT INTO conversation_stars (conversation_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, convID, userID)
+	} else {
+		_, err = s.pool.Exec(ctx, `DELETE FROM conversation_stars WHERE conversation_id = $1 AND user_id = $2`, convID, userID)
+	}
 	return err
 }
 
-// ThreadInput is a reply or a note written by an agent.
-type ThreadInput struct {
-	Kind string // reply | note
-	// Body is the plain text; BodyHTML the rich text from the editor. At
-	// least one is required; a missing plain text is derived from the HTML.
-	Body     string
-	BodyHTML string
-	// CC for a reply. nil: everyone the customer's last message went to,
-	// except Desk's own mailboxes and the customer.
-	CC *[]string
-	// Status after a reply (default pending: waiting on the customer).
-	Status *string
-}
-
-// composeBodies returns sanitised HTML and plain text for an agent's
-// message.
-func composeBodies(text, rich string) (string, string) {
-	text = strings.TrimSpace(clean(text))
-	rich = strings.TrimSpace(clean(rich))
-	if rich == "" {
-		return textToHTML(text), text
+func systemLine(ctx context.Context, tx pgx.Tx, convID, actorID uuid.UUID, text string) error {
+	var author *uuid.UUID
+	if actorID != uuid.Nil {
+		author = &actorID
 	}
-	safe := htmlPolicy.Sanitize(rich)
-	if text == "" {
-		text = htmlToText(safe)
-	}
-	return safe, text
-}
-
-var (
-	blockEnd   = regexp.MustCompile(`(?i)</(p|div|h[1-6]|li|blockquote|tr|pre)>|<br\s*/?>`)
-	listItem   = regexp.MustCompile(`(?i)<li[^>]*>`)
-	manyBlanks = regexp.MustCompile(`\n{3,}`)
-)
-
-// htmlToText is the plain-text alternative of an HTML message.
-func htmlToText(h string) string {
-	h = blockEnd.ReplaceAllString(h, "$0\n")
-	h = listItem.ReplaceAllString(h, "$0- ")
-	t := html.UnescapeString(stripPolicy.Sanitize(h))
-	lines := strings.Split(t, "\n")
-	for i, l := range lines {
-		lines[i] = strings.TrimRight(l, " \t")
-	}
-	return strings.TrimSpace(manyBlanks.ReplaceAllString(strings.Join(lines, "\n"), "\n\n"))
-}
-
-// AddThread stores a reply (queued for sending) or an internal note.
-func (s *Service) AddThread(ctx context.Context, c Conversation, author *Person, in ThreadInput) (uuid.UUID, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return uuid.Nil, err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	id, err := s.addThreadTx(ctx, tx, c, author, in)
-	if err != nil {
-		return uuid.Nil, err
-	}
-	return id, tx.Commit(ctx)
-}
-
-func (s *Service) addThreadTx(ctx context.Context, tx pgx.Tx, c Conversation, author *Person, in ThreadInput) (uuid.UUID, error) {
-	if in.Kind != domain.ThreadReply && in.Kind != domain.ThreadNote {
-		return uuid.Nil, httperror.BadRequest("kind must be reply or note")
-	}
-	htmlBody, text := composeBodies(in.Body, in.BodyHTML)
-	if text == "" {
-		return uuid.Nil, httperror.Validation("empty message", map[string]string{"body": "required"})
-	}
-
-	threadID := uuid.New()
-	if in.Kind == domain.ThreadNote {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO threads (id, conversation_id, kind, author_id, body_text, body_html)
-			VALUES ($1, $2, 'note', $3, $4, $5)`, threadID, c.ID, author.ID, text, htmlBody); err != nil {
-			return uuid.Nil, err
-		}
-		_, err := tx.Exec(ctx, `UPDATE conversations SET last_activity_at = now() WHERE id = $1`, c.ID)
-		return threadID, err
-	}
-
-	mb, err := s.GetMailbox(ctx, c.MailboxID)
-	if err != nil {
-		return uuid.Nil, err
-	}
-	var cc []string
-	if in.CC != nil {
-		cc, err = cleanAddresses(*in.CC, "cc")
-		if err != nil {
-			return uuid.Nil, err
-		}
-	} else if cc, err = defaultCC(ctx, tx, c); err != nil {
-		return uuid.Nil, err
-	}
-	if sig := strings.TrimSpace(strings.ReplaceAll(mb.Signature, "{agent.name}", author.DisplayName)); sig != "" {
-		text += "\n\n" + sig
-		htmlBody += "<br><br>" + textToHTML(sig)
-	}
-	msgID := fmt.Sprintf("desk.%s@%s", threadID, domainOf(mb.Email))
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO threads (id, conversation_id, kind, author_id, from_email, to_emails, cc_emails, body_text, body_html,
-		                     message_id, send_status, next_attempt_at)
-		VALUES ($1, $2, 'reply', $3, $4, $5, $6, $7, $8, $9, 'queued', now() + $10::interval)`,
-		threadID, c.ID, author.ID, mb.Email, []string{c.Customer.Email}, cc, text, htmlBody,
-		msgID, fmt.Sprintf("%d seconds", int(undoWindow.Seconds()))); err != nil {
-		return uuid.Nil, err
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO message_ids (message_id, conversation_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, msgID, c.ID); err != nil {
-		return uuid.Nil, err
-	}
-	status := domain.StatusPending
-	if in.Status != nil {
-		status = *in.Status
-	}
-	upd := UpdateInput{Status: &status}
-	if c.AssigneeID == nil {
-		// Answering an unassigned conversation takes it, as in FreeScout.
-		upd.AssigneeID = &author.ID
-	}
-	if err := s.applyUpdate(ctx, tx, c, author.ID, upd); err != nil {
-		return uuid.Nil, err
-	}
-	_, err = tx.Exec(ctx, `UPDATE conversations SET last_activity_at = now(), preview = $2 WHERE id = $1`, c.ID, previewOf(text))
-	return threadID, err
-}
-
-// cleanAddresses validates a list of plain addresses.
-func cleanAddresses(list []string, field string) ([]string, error) {
-	out := []string{}
-	seen := map[string]bool{}
-	for _, raw := range list {
-		a, err := mail.ParseAddress(strings.TrimSpace(raw))
-		if err != nil {
-			return nil, httperror.Validation("invalid address", map[string]string{field: raw + " is not an email address"})
-		}
-		addr := strings.ToLower(a.Address)
-		if !seen[addr] {
-			seen[addr] = true
-			out = append(out, addr)
-		}
-	}
-	if len(out) > 20 {
-		return nil, httperror.Validation("too many recipients", map[string]string{field: "at most 20 addresses"})
-	}
-	return out, nil
-}
-
-// defaultCC is "reply all": the To and Cc of the customer's latest message
-// without Desk's own mailboxes and the customer themself.
-func defaultCC(ctx context.Context, tx pgx.Tx, c Conversation) ([]string, error) {
-	var to, cc []string
-	err := tx.QueryRow(ctx, `
-		SELECT to_emails, cc_emails FROM threads
-		 WHERE conversation_id = $1 AND kind = 'customer' AND NOT auto_submitted
-		 ORDER BY created_at DESC LIMIT 1`, c.ID).Scan(&to, &cc)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return []string{}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	rows, err := tx.Query(ctx, `SELECT lower(email::text) FROM mailboxes`)
-	if err != nil {
-		return nil, err
-	}
-	own := map[string]bool{strings.ToLower(c.Customer.Email): true}
-	for rows.Next() {
-		var e string
-		if rows.Scan(&e) == nil {
-			own[e] = true
-		}
-	}
-	rows.Close()
-	out := []string{}
-	for _, a := range append(to, cc...) {
-		a = strings.ToLower(a)
-		if !own[a] {
-			own[a] = true
-			out = append(out, a)
-		}
-	}
-	return out, nil
-}
-
-// UndoReply deletes a reply that has not been sent yet.
-func (s *Service) UndoReply(ctx context.Context, threadID uuid.UUID) error {
-	tag, err := s.pool.Exec(ctx, `
-		DELETE FROM threads WHERE id = $1 AND kind IN ('reply', 'forward') AND send_status = 'queued' AND send_attempts = 0
-		   AND next_attempt_at > now()`, threadID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return httperror.Conflict("too late: the reply is already being sent")
-	}
-	_, _ = s.pool.Exec(ctx, `DELETE FROM message_ids WHERE message_id LIKE $1`, "desk."+threadID.String()+"@%")
-	return nil
-}
-
-// RetryReply puts a failed reply back in the queue.
-func (s *Service) RetryReply(ctx context.Context, threadID uuid.UUID) error {
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE threads SET send_status = 'queued', send_attempts = 0, send_error = '', next_attempt_at = now()
-		 WHERE id = $1 AND kind IN ('reply', 'forward', 'auto_reply') AND send_status = 'failed'`, threadID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return httperror.Conflict("only failed replies can be retried")
-	}
-	return nil
-}
-
-// ThreadConversation returns the conversation a thread belongs to.
-func (s *Service) ThreadConversation(ctx context.Context, threadID uuid.UUID) (Conversation, error) {
-	var convID uuid.UUID
-	err := s.pool.QueryRow(ctx, `SELECT conversation_id FROM threads WHERE id = $1`, threadID).Scan(&convID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Conversation{}, httperror.NotFound("thread")
-	}
-	if err != nil {
-		return Conversation{}, err
-	}
-	return s.GetConversation(ctx, convID)
-}
-
-// NewConversationInput starts a conversation from Desk (agent writes first).
-type NewConversationInput struct {
-	MailboxID     uuid.UUID
-	CustomerEmail string
-	CustomerName  string
-	Subject       string
-	Body          string
-	BodyHTML      string
-	CC            []string
-}
-
-// CreateConversation opens a conversation and queues its first reply, in
-// one transaction: a failure leaves nothing behind.
-func (s *Service) CreateConversation(ctx context.Context, author *Person, in NewConversationInput) (Conversation, error) {
-	addr, err := mail.ParseAddress(strings.TrimSpace(in.CustomerEmail))
-	issues := map[string]string{}
-	if err != nil {
-		issues["customer_email"] = "must be an email address"
-	}
-	if strings.TrimSpace(in.Subject) == "" {
-		issues["subject"] = "required"
-	}
-	if _, text := composeBodies(in.Body, in.BodyHTML); text == "" {
-		issues["body"] = "required"
-	}
-	if len(issues) > 0 {
-		return Conversation{}, httperror.Validation("invalid conversation", issues)
-	}
-	mb, err := s.GetMailbox(ctx, in.MailboxID)
-	if err != nil {
-		return Conversation{}, err
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return Conversation{}, err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	name := strings.TrimSpace(in.CustomerName)
-	if name == "" {
-		name = addr.Name
-	}
-	customerID, err := upsertCustomer(ctx, tx, mb.OrganizationID, addr.Address, name)
-	if err != nil {
-		return Conversation{}, err
-	}
-	convID, err := insertConversation(ctx, tx, mb.ID, customerID, clean(strings.TrimSpace(in.Subject)), domain.StatusActive)
-	if err != nil {
-		return Conversation{}, err
-	}
-	c, err := scanConversation(tx.QueryRow(ctx, convSelect+" WHERE c.id = $1", convID))
-	if err != nil {
-		return Conversation{}, err
-	}
-	cc := in.CC
-	if cc == nil {
-		cc = []string{}
-	}
-	if _, err := s.addThreadTx(ctx, tx, c, author, ThreadInput{Kind: domain.ThreadReply, Body: in.Body, BodyHTML: in.BodyHTML, CC: &cc}); err != nil {
-		return Conversation{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return Conversation{}, err
-	}
-	return s.GetConversation(ctx, convID)
-}
-
-// UpdateCustomer changes a customer's name and notes.
-func (s *Service) UpdateCustomer(ctx context.Context, id uuid.UUID, name, notes *string) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE customers SET name = COALESCE($2, name), notes = COALESCE($3, notes), updated_at = now()
-		 WHERE id = $1`, id, name, notes)
+	_, err := tx.Exec(ctx, `
+		INSERT INTO threads (conversation_id, kind, author_id, body_text, body_html)
+		VALUES ($1, 'system', $2, $3, $4)`, convID, author, text, html.EscapeString(text))
 	return err
 }
 
@@ -680,28 +578,46 @@ func (s *Service) OpenAttachment(ctx context.Context, key string) (io.ReadCloser
 // Helpers shared with the inbound path
 // ----------------------------------------------------------------------------
 
+// upsertCustomer finds the customer by any of their addresses or creates
+// one.
 func upsertCustomer(ctx context.Context, tx pgx.Tx, orgID uuid.UUID, email, name string) (uuid.UUID, error) {
+	email = strings.ToLower(email)
 	var id uuid.UUID
-	err := tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `SELECT customer_id FROM customer_emails WHERE organization_id = $1 AND email = $2`, orgID, email).Scan(&id)
+	if err == nil {
+		_, err = tx.Exec(ctx, `UPDATE customers SET name = $2 WHERE id = $1 AND name = '' AND $2 <> ''`, id, name)
+		return id, err
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, err
+	}
+	if err := tx.QueryRow(ctx, `
 		INSERT INTO customers (organization_id, email, name) VALUES ($1, $2, $3)
 		ON CONFLICT (organization_id, email) DO UPDATE
 		   SET name = CASE WHEN customers.name = '' THEN EXCLUDED.name ELSE customers.name END
-		RETURNING id`, orgID, strings.ToLower(email), name).Scan(&id)
+		RETURNING id`, orgID, email, name).Scan(&id); err != nil {
+		return uuid.Nil, err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO customer_emails (customer_id, organization_id, email) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, id, orgID, email)
 	return id, err
 }
 
 func insertConversation(ctx context.Context, tx pgx.Tx, mailboxID, customerID uuid.UUID, subject, status string) (uuid.UUID, error) {
-	var number int
-	if err := tx.QueryRow(ctx, `
-		UPDATE mailboxes SET next_number = next_number + 1 WHERE id = $1 RETURNING next_number - 1`, mailboxID,
-	).Scan(&number); err != nil {
+	number, err := nextNumber(ctx, tx, mailboxID)
+	if err != nil {
 		return uuid.Nil, err
 	}
 	var id uuid.UUID
-	err := tx.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO conversations (mailbox_id, number, subject, customer_id, status)
 		VALUES ($1, $2, $3, $4, $5) RETURNING id`, mailboxID, number, subject, customerID, status).Scan(&id)
 	return id, err
+}
+
+func nextNumber(ctx context.Context, tx pgx.Tx, mailboxID uuid.UUID) (int, error) {
+	var number int
+	err := tx.QueryRow(ctx, `UPDATE mailboxes SET next_number = next_number + 1 WHERE id = $1 RETURNING next_number - 1`, mailboxID).Scan(&number)
+	return number, err
 }
 
 func textToHTML(text string) string {
