@@ -144,7 +144,8 @@ func newDeskService(pool *pgxpool.Pool, cfg *config.Config) (*desk.Service, erro
 			Host: cfg.SMTPHost, Port: cfg.SMTPPort, Security: cfg.SMTPSecurity,
 			Username: cfg.SMTPUsername, Password: cfg.SMTPPassword,
 		},
-		Development: cfg.IsDevelopment(),
+		Development:      cfg.IsDevelopment(),
+		AllowedMailHosts: cfg.AllowedMailHosts,
 	}), nil
 }
 

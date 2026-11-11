@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AGlElectronics/desk/backend/internal/httperror"
+	"github.com/AGlElectronics/desk/backend/internal/netguard"
 	"github.com/AGlElectronics/desk/backend/internal/secretbox"
 )
 
@@ -29,6 +30,8 @@ type SMTPSettings struct {
 	Security string
 	Username string
 	Password string
+
+	moduleWide bool
 }
 
 // Options configures a Service.
@@ -39,14 +42,20 @@ type Options struct {
 	SMTP SMTPSettings
 	// Development unlocks plaintext mail connections (APP_ENV=development).
 	Development bool
+	// AllowedMailHosts may resolve to private addresses
+	// (DESK_ALLOWED_MAIL_HOSTS); every other mailbox host may not.
+	AllowedMailHosts []string
 }
 
 // Service is safe for concurrent use.
 type Service struct {
-	pool *pgxpool.Pool
-	keys *secretbox.Keyring
-	smtp SMTPSettings
-	dev  bool
+	pool  *pgxpool.Pool
+	keys  *secretbox.Keyring
+	smtp  SMTPSettings
+	dev   bool
+	guard *netguard.Guard
+	// fetchInterval is the polling interval back-off starts from.
+	fetchInterval time.Duration
 	// fetchNow wakes the fetcher early ("Fetch now" in the UI).
 	fetchNow chan uuid.UUID
 }
@@ -58,7 +67,9 @@ func NewService(pool *pgxpool.Pool, opts Options) *Service {
 	}
 	return &Service{
 		pool: pool, keys: opts.Keyring, smtp: opts.SMTP, dev: opts.Development,
-		fetchNow: make(chan uuid.UUID, 16),
+		guard:         netguard.New(opts.AllowedMailHosts),
+		fetchInterval: time.Minute,
+		fetchNow:      make(chan uuid.UUID, 16),
 	}
 }
 
@@ -172,8 +183,11 @@ type Mailbox struct {
 	SMTPSecurity    string     `json:"smtp_security"`
 	SMTPUsername    string     `json:"smtp_username"`
 	SMTPPasswordSet bool       `json:"smtp_password_set"`
+	IMAPMoveTo      string     `json:"imap_move_to"`
 	LastFetchAt     *time.Time `json:"last_fetch_at,omitempty"`
 	LastFetchError  string     `json:"last_fetch_error"`
+	FetchFailures   int        `json:"fetch_failures"`
+	NextFetchAt     *time.Time `json:"next_fetch_at,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
 
 	imapPasswordEnc string
@@ -202,7 +216,8 @@ type MailboxWithCounts struct {
 const mailboxCols = `id, organization_id, name, email::text, signature,
 	imap_host, imap_port, imap_security, imap_username, imap_password_enc,
 	smtp_host, smtp_port, smtp_security, smtp_username, smtp_password_enc,
-	last_fetch_at, last_fetch_error, created_at, last_uid, uid_validity`
+	imap_move_to, last_fetch_at, last_fetch_error, fetch_failures, next_fetch_at,
+	created_at, last_uid, uid_validity`
 
 func scanMailbox(row pgx.Row) (Mailbox, error) {
 	var m Mailbox
@@ -210,7 +225,8 @@ func scanMailbox(row pgx.Row) (Mailbox, error) {
 	err := row.Scan(&m.ID, &m.OrganizationID, &m.Name, &m.Email, &m.Signature,
 		&m.IMAPHost, &m.IMAPPort, &m.IMAPSecurity, &m.IMAPUsername, &m.imapPasswordEnc,
 		&m.SMTPHost, &m.SMTPPort, &m.SMTPSecurity, &m.SMTPUsername, &m.smtpPasswordEnc,
-		&m.LastFetchAt, &m.LastFetchError, &m.CreatedAt, &lastUID, &uidValidity)
+		&m.IMAPMoveTo, &m.LastFetchAt, &m.LastFetchError, &m.FetchFailures, &m.NextFetchAt,
+		&m.CreatedAt, &lastUID, &uidValidity)
 	m.IMAPPasswordSet = m.imapPasswordEnc != ""
 	m.SMTPPasswordSet = m.smtpPasswordEnc != ""
 	m.lastUID = uint32(lastUID)
@@ -278,6 +294,7 @@ type MailboxInput struct {
 	IMAPSecurity *string `json:"imap_security"`
 	IMAPUsername *string `json:"imap_username"`
 	IMAPPassword *string `json:"imap_password"`
+	IMAPMoveTo   *string `json:"imap_move_to"`
 	SMTPHost     *string `json:"smtp_host"`
 	SMTPPort     *int    `json:"smtp_port"`
 	SMTPSecurity *string `json:"smtp_security"`
@@ -285,19 +302,36 @@ type MailboxInput struct {
 	SMTPPassword *string `json:"smtp_password"`
 }
 
-func validSecurity(v *string) bool {
+func (s *Service) checkSecurity(v *string) string {
 	if v == nil {
-		return true
+		return ""
 	}
 	switch *v {
-	case "tls", "starttls", "none":
-		return true
+	case "tls", "starttls":
+		return ""
+	case "none":
+		if s.dev {
+			return ""
+		}
+		return "plaintext (none) is only allowed in development; use tls or starttls"
 	}
-	return false
+	return "must be tls or starttls"
 }
 
-func (in *MailboxInput) validate(create bool) error {
+func checkPort(v *int) string {
+	if v != nil && (*v < 1 || *v > 65535) {
+		return "must be between 1 and 65535"
+	}
+	return ""
+}
+
+func (s *Service) validateMailbox(in *MailboxInput, create bool) map[string]string {
 	issues := map[string]string{}
+	set := func(field, msg string) {
+		if msg != "" {
+			issues[field] = msg
+		}
+	}
 	if create || in.Name != nil {
 		if in.Name == nil || strings.TrimSpace(*in.Name) == "" {
 			issues["name"] = "required"
@@ -310,25 +344,35 @@ func (in *MailboxInput) validate(create bool) error {
 			issues["email"] = "must be a plain email address"
 		}
 	}
-	if !validSecurity(in.IMAPSecurity) {
-		issues["imap_security"] = "must be tls, starttls or none"
+	set("imap_security", s.checkSecurity(in.IMAPSecurity))
+	set("smtp_security", s.checkSecurity(in.SMTPSecurity))
+	set("imap_port", checkPort(in.IMAPPort))
+	set("smtp_port", checkPort(in.SMTPPort))
+	for field, host := range map[string]*string{"imap_host": in.IMAPHost, "smtp_host": in.SMTPHost} {
+		if host != nil && strings.ContainsAny(strings.TrimSpace(*host), " /:@") {
+			issues[field] = "must be a host name or address without port or scheme"
+		}
 	}
-	if !validSecurity(in.SMTPSecurity) {
-		issues["smtp_security"] = "must be tls, starttls or none"
-	}
-	if len(issues) > 0 {
-		return httperror.Validation("invalid mailbox", issues)
-	}
-	return nil
+	return issues
+}
+
+// changed reports whether a non-nil input differs from the current value.
+func changed(in *string, current string) bool {
+	return in != nil && !strings.EqualFold(strings.TrimSpace(*in), current)
 }
 
 // CreateMailbox stores a new mailbox in orgID.
 func (s *Service) CreateMailbox(ctx context.Context, orgID uuid.UUID, in MailboxInput) (Mailbox, error) {
-	if err := in.validate(true); err != nil {
+	if issues := s.validateMailbox(&in, true); len(issues) > 0 {
+		return Mailbox{}, httperror.Validation("invalid mailbox", issues)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
 		return Mailbox{}, err
 	}
+	defer tx.Rollback(ctx) //nolint:errcheck
 	var id uuid.UUID
-	err := s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO mailboxes (organization_id, name, email) VALUES ($1, $2, $3) RETURNING id
 	`, orgID, strings.TrimSpace(*in.Name), strings.TrimSpace(*in.Email)).Scan(&id)
 	if err != nil {
@@ -338,14 +382,57 @@ func (s *Service) CreateMailbox(ctx context.Context, orgID uuid.UUID, in Mailbox
 		return Mailbox{}, err
 	}
 	in.Name, in.Email = nil, nil
-	return s.UpdateMailbox(ctx, id, in)
+	if err := s.applyMailboxInput(ctx, tx, Mailbox{ID: id}, in); err != nil {
+		return Mailbox{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Mailbox{}, err
+	}
+	return s.GetMailbox(ctx, id)
 }
 
 // UpdateMailbox applies the non-nil fields of in.
+//
+// Moving a mailbox to another IMAP or SMTP server or account needs its
+// password in the same request: Desk never sends a stored password to a
+// host it was not entered for.
 func (s *Service) UpdateMailbox(ctx context.Context, id uuid.UUID, in MailboxInput) (Mailbox, error) {
-	if err := in.validate(false); err != nil {
+	if issues := s.validateMailbox(&in, false); len(issues) > 0 {
+		return Mailbox{}, httperror.Validation("invalid mailbox", issues)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
 		return Mailbox{}, err
 	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	cur, err := scanMailbox(tx.QueryRow(ctx, `SELECT `+mailboxCols+` FROM mailboxes WHERE id = $1 FOR UPDATE`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Mailbox{}, httperror.NotFound("mailbox")
+	}
+	if err != nil {
+		return Mailbox{}, err
+	}
+	issues := map[string]string{}
+	if (changed(in.IMAPHost, cur.IMAPHost) || changed(in.IMAPUsername, cur.IMAPUsername)) && cur.imapPasswordEnc != "" && in.IMAPPassword == nil {
+		issues["imap_password"] = "enter the password again when the IMAP server or username changes"
+	}
+	if (changed(in.SMTPHost, cur.SMTPHost) || changed(in.SMTPUsername, cur.SMTPUsername)) && cur.smtpPasswordEnc != "" && in.SMTPPassword == nil {
+		issues["smtp_password"] = "enter the password again when the SMTP server or username changes"
+	}
+	if len(issues) > 0 {
+		return Mailbox{}, httperror.Validation("password required", issues)
+	}
+	if err := s.applyMailboxInput(ctx, tx, cur, in); err != nil {
+		return Mailbox{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Mailbox{}, err
+	}
+	return s.GetMailbox(ctx, id)
+}
+
+func (s *Service) applyMailboxInput(ctx context.Context, tx pgx.Tx, cur Mailbox, in MailboxInput) error {
+	id := cur.ID
 	sets := []string{}
 	args := []any{id}
 	add := func(col string, v any) {
@@ -363,7 +450,7 @@ func (s *Service) UpdateMailbox(ctx context.Context, id uuid.UUID, in MailboxInp
 		add("signature", *in.Signature)
 	}
 	if in.IMAPHost != nil {
-		add("imap_host", trim(in.IMAPHost))
+		add("imap_host", strings.ToLower(trim(in.IMAPHost)))
 	}
 	if in.IMAPPort != nil {
 		add("imap_port", *in.IMAPPort)
@@ -377,12 +464,15 @@ func (s *Service) UpdateMailbox(ctx context.Context, id uuid.UUID, in MailboxInp
 	if in.IMAPPassword != nil {
 		enc, err := s.encrypt(id, "imap_password", *in.IMAPPassword)
 		if err != nil {
-			return Mailbox{}, err
+			return err
 		}
 		add("imap_password_enc", enc)
 	}
+	if in.IMAPMoveTo != nil {
+		add("imap_move_to", trim(in.IMAPMoveTo))
+	}
 	if in.SMTPHost != nil {
-		add("smtp_host", trim(in.SMTPHost))
+		add("smtp_host", strings.ToLower(trim(in.SMTPHost)))
 	}
 	if in.SMTPPort != nil {
 		add("smtp_port", *in.SMTPPort)
@@ -396,25 +486,29 @@ func (s *Service) UpdateMailbox(ctx context.Context, id uuid.UUID, in MailboxInp
 	if in.SMTPPassword != nil {
 		enc, err := s.encrypt(id, "smtp_password", *in.SMTPPassword)
 		if err != nil {
-			return Mailbox{}, err
+			return err
 		}
 		add("smtp_password_enc", enc)
 	}
-	if in.IMAPHost != nil || in.IMAPUsername != nil {
+	if changed(in.IMAPHost, cur.IMAPHost) || changed(in.IMAPUsername, cur.IMAPUsername) {
 		// A different server or account: start from its first message.
 		sets = append(sets, "last_uid = 0", "uid_validity = 0")
 	}
-	if len(sets) > 0 {
-		sets = append(sets, "updated_at = now()")
-		_, err := s.pool.Exec(ctx, `UPDATE mailboxes SET `+strings.Join(sets, ", ")+` WHERE id = $1`, args...)
-		if err != nil {
-			if isUniqueViolation(err) {
-				return Mailbox{}, httperror.Conflict("a mailbox with this email address already exists")
-			}
-			return Mailbox{}, err
-		}
+	if in.IMAPHost != nil || in.IMAPPort != nil || in.IMAPSecurity != nil || in.IMAPUsername != nil || in.IMAPPassword != nil {
+		// New settings deserve a try right away, not after the back-off.
+		sets = append(sets, "fetch_failures = 0", "next_fetch_at = NULL")
 	}
-	return s.GetMailbox(ctx, id)
+	if len(sets) == 0 {
+		return nil
+	}
+	sets = append(sets, "updated_at = now()")
+	if _, err := tx.Exec(ctx, `UPDATE mailboxes SET `+strings.Join(sets, ", ")+` WHERE id = $1`, args...); err != nil {
+		if isUniqueViolation(err) {
+			return httperror.Conflict("a mailbox with this email address already exists")
+		}
+		return err
+	}
+	return nil
 }
 
 // DeleteMailbox removes a mailbox and every conversation in it.

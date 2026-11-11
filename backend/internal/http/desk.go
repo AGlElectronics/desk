@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/hlog"
 
 	"github.com/AGlElectronics/desk/backend/internal/auth"
 	"github.com/AGlElectronics/desk/backend/internal/desk"
@@ -129,7 +130,7 @@ func (h *deskHandler) testMailbox(w http.ResponseWriter, r *http.Request) {
 		httperror.Render(w, r, err)
 		return
 	}
-	out, err := h.svc.TestConnection(r.Context(), id)
+	out, err := h.svc.TestConnection(r.Context(), id, *hlog.FromRequest(r))
 	if err != nil {
 		httperror.Render(w, r, err)
 		return

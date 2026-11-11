@@ -26,6 +26,10 @@ import (
 // in the thread text but not kept.
 const maxAttachmentBytes = 20 << 20
 
+// maxMessageBytes caps a whole message; larger ones are recorded as import
+// failures and not downloaded.
+const maxMessageBytes = 50 << 20
+
 var (
 	htmlPolicy  = bluemonday.UGCPolicy()
 	stripPolicy = bluemonday.StrictPolicy()
@@ -172,7 +176,7 @@ type ImportResult struct {
 // Import stores one inbound message in mb: threads it into an existing
 // conversation (In-Reply-To / References, then "[#123]" in the subject) or
 // opens a new one. Re-importing the same Message-ID does nothing.
-func (s *Service) Import(ctx context.Context, mb Mailbox, p *ParsedMessage) (ImportResult, error) {
+func (s *Service) Import(ctx context.Context, mb Mailbox, p *ParsedMessage, raw []byte) (ImportResult, error) {
 	if p.FromEmail == "" {
 		return ImportResult{Skipped: "no sender"}, nil
 	}

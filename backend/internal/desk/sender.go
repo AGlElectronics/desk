@@ -18,6 +18,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
+
+	"github.com/AGlElectronics/desk/backend/internal/netguard"
 )
 
 // retryDelays is the wait after each failed attempt; after the last one the
@@ -145,7 +147,7 @@ func (s *Service) sendReply(ctx context.Context, threadID uuid.UUID) error {
 	if err != nil {
 		return err
 	}
-	cl, err := dialSMTP(cfg)
+	cl, err := s.dialSMTP(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -176,29 +178,49 @@ func (s *Service) smtpFor(mb Mailbox) (SMTPSettings, error) {
 	if mb.SMTPHost != "" {
 		pw, err := s.decrypt(mb.ID, "smtp_password", mb.smtpPasswordEnc)
 		if err != nil {
-			return SMTPSettings{}, err
+			return SMTPSettings{}, displayError{msg: err.Error()}
 		}
 		return SMTPSettings{Host: mb.SMTPHost, Port: mb.SMTPPort, Security: mb.SMTPSecurity, Username: mb.SMTPUsername, Password: pw}, nil
 	}
 	if s.smtp.Host == "" {
-		return SMTPSettings{}, errors.New("no SMTP server: set one on the mailbox or SMTP_HOST for the module")
+		return SMTPSettings{}, displayError{msg: "no SMTP server: set one on the mailbox or SMTP_HOST for the module"}
 	}
-	return s.smtp, nil
+	cfg := s.smtp
+	cfg.moduleWide = true
+	return cfg, nil
 }
 
-func dialSMTP(cfg SMTPSettings) (*smtp.Client, error) {
-	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+func (cfg SMTPSettings) label() string {
+	if cfg.moduleWide {
+		return "module SMTP server (SMTP_HOST)"
+	}
+	return net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+}
+
+// dialSMTP connects and logs in. Mailbox-specific hosts go through the
+// network guard; the module-wide SMTP_HOST is set by the operator and is
+// trusted.
+func (s *Service) dialSMTP(ctx context.Context, cfg SMTPSettings) (*smtp.Client, error) {
+	if cfg.Security == "none" && !s.dev {
+		return nil, displayError{msg: "plaintext SMTP is only allowed in development; choose TLS or STARTTLS"}
+	}
+	port := strconv.Itoa(cfg.Port)
 	tlsCfg := &tls.Config{ServerName: cfg.Host, MinVersion: tls.VersionTLS12}
-	dialer := &net.Dialer{Timeout: dialTimeout}
+	dctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	guard := s.guard
+	if cfg.moduleWide {
+		guard = netguard.New([]string{cfg.Host})
+	}
 	var conn net.Conn
 	var err error
 	if cfg.Security == "tls" {
-		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
+		conn, err = guard.DialTLS(dctx, cfg.Host, port, dialTimeout, tlsCfg)
 	} else {
-		conn, err = dialer.Dial("tcp", addr)
+		conn, err = guard.Dial(dctx, cfg.Host, port, dialTimeout)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("connect to %s: %w", addr, err)
+		return nil, fmt.Errorf("connect: %w", err)
 	}
 	_ = conn.SetDeadline(time.Now().Add(sessionTimeout))
 	cl, err := smtp.NewClient(conn, cfg.Host)
@@ -217,12 +239,34 @@ func dialSMTP(cfg SMTPSettings) (*smtp.Client, error) {
 		}
 	}
 	if cfg.Username != "" {
-		if err := cl.Auth(smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)); err != nil {
+		if err := cl.Auth(plainAuth{username: cfg.Username, password: cfg.Password, allowPlaintext: cfg.Security == "none"}); err != nil {
 			cl.Close()
-			return nil, fmt.Errorf("login as %s: %w", cfg.Username, err)
+			return nil, fmt.Errorf("%w (%v)", errLogin, err)
 		}
 	}
 	return cl, nil
+}
+
+// plainAuth is SMTP AUTH PLAIN. net/smtp's PlainAuth refuses plaintext
+// connections except to localhost; Desk allows them only with
+// SMTP_SECURITY=none, which config limits to development.
+type plainAuth struct {
+	username, password string
+	allowPlaintext     bool
+}
+
+func (a plainAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	if !server.TLS && !a.allowPlaintext {
+		return "", nil, errors.New("refusing to send the password over an unencrypted connection")
+	}
+	return "PLAIN", []byte("\x00" + a.username + "\x00" + a.password), nil
+}
+
+func (a plainAuth) Next(_ []byte, more bool) ([]byte, error) {
+	if more {
+		return nil, errors.New("unexpected server challenge")
+	}
+	return nil, nil
 }
 
 type outgoing struct {
