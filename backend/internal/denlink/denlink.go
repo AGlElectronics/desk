@@ -1,15 +1,21 @@
+// Code generated from con-services shared/go/denlink; DO NOT EDIT. Run scripts/sync-shared.
+
 // Package denlink pairs this module with Den and keeps a local copy of Den's
-// brand and organisation settings. It is identical in every Con Services
-// module (HR, Stash, Rally, Desk); keep the copies in sync.
+// brand and organisation settings. Its source is con-services
+// shared/go/denlink; every module carries a generated copy (see
+// scripts/sync-shared).
 //
 // With DEN_MODE=required (Config.Mode) the module refuses its API with 503
 // den_pairing_required until it is paired; see RequirePaired.
 //
 // Flow: an admin mints a pairing URL in Den (Admin → Modules) and pastes it
 // into this module. The backend redeems it for a long-lived module
-// credential, stores it in the module's own database (table den_link), and
-// pulls GET /api/v1/integrations/bundle every minute. Without a pairing the
-// module is standalone and uses its own settings and default look.
+// credential, stores it encrypted (DEN_LINK_ENCRYPTION_KEY) in the module's
+// own database (table den_link, see Schema), and pulls
+// GET /api/v1/integrations/bundle every minute. Without a pairing the
+// module is standalone and uses its own settings and default look. When Den
+// rejects the credential the link is marked revoked and stays so until an
+// admin pairs again; it is never re-paired automatically.
 package denlink
 
 import (
@@ -19,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -26,12 +33,44 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 )
 
 // SyncInterval is how often a paired module pulls from Den.
 const SyncInterval = time.Minute
+
+// Environment variables read by FromEnv.
+const (
+	EnvMode                  = "DEN_MODE"
+	EnvInternalURL           = "DEN_INTERNAL_URL"
+	EnvAllowedHosts          = "DEN_ALLOWED_HOSTS"
+	EnvEncryptionKey         = "DEN_LINK_ENCRYPTION_KEY"
+	EnvEncryptionKeyPrevious = "DEN_LINK_ENCRYPTION_KEY_PREVIOUS"
+	EnvAppEnv                = "APP_ENV"
+)
+
+// Schema is the den_link table for a new module's first migration.
+const Schema = `CREATE TABLE den_link (
+    id            SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    den_base_url  TEXT NOT NULL,
+    credential    TEXT NOT NULL,
+    module_id     TEXT NOT NULL DEFAULT '',
+    paired_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    synced_at     TIMESTAMPTZ,
+    last_error    TEXT NOT NULL DEFAULT '',
+    bundle        JSONB,
+    revoked_at    TIMESTAMPTZ
+);`
+
+// SchemaUpgrade brings an existing den_link table up to Schema. Add it as a
+// migration when adopting this version of the package.
+const SchemaUpgrade = `ALTER TABLE den_link ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;`
+
+// DevAllowedHosts are accepted as pairing hosts in APP_ENV=development, in
+// addition to DEN_ALLOWED_HOSTS.
+var DevAllowedHosts = []string{"localhost", "127.0.0.1", "::1", "*.conservices.test"}
 
 // Brand is Den's brand bundle.
 type Brand struct {
@@ -44,13 +83,17 @@ type Brand struct {
 	Assets           map[string]string `json:"assets"`
 }
 
-// Bundle is what Den returns from /api/v1/integrations/bundle.
+// Bundle is what Den returns from /api/v1/integrations/bundle. It is stored
+// as received (den_link.bundle), so every field survives a restart.
 type Bundle struct {
 	Brand    Brand `json:"brand"`
 	Settings struct {
 		Data      map[string]any `json:"data"`
 		UpdatedAt *string        `json:"updated_at"`
 	} `json:"settings"`
+	// ModuleSettings is nil when Den sends none (older Den, or a bundle
+	// stored before Den had module settings).
+	ModuleSettings *ModuleSettings `json:"module_settings,omitempty"`
 }
 
 // Status is shown on the module's settings page.
@@ -61,6 +104,10 @@ type Status struct {
 	PairedAt   *time.Time `json:"paired_at,omitempty"`
 	SyncedAt   *time.Time `json:"synced_at,omitempty"`
 	LastError  string     `json:"last_error,omitempty"`
+	// Revoked is true after Den rejected the credential (401). The admin
+	// must pair again; the module keeps its last bundle meanwhile.
+	Revoked   bool       `json:"revoked"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
 }
 
 // Mode is DEN_MODE: whether the module may serve its API before it is
@@ -91,10 +138,93 @@ type Config struct {
 	Slug, Version string
 	// InternalURL, when set, replaces the scheme and host of pasted pairing
 	// URLs (e.g. http://den-backend:8080 inside Docker, where the URL Den
-	// shows the admin is not reachable).
+	// shows the admin is not reachable). The pasted host is then never
+	// contacted, so AllowedHosts does not apply.
 	InternalURL string
 	// Mode is DEN_MODE; empty means standalone.
 	Mode Mode
+	// AppEnv is APP_ENV (FromEnv stores it through NormalizeAppEnv). Only
+	// "development", in any case, relaxes the rules below; empty means
+	// production.
+	AppEnv string
+	// AllowedHosts is DEN_ALLOWED_HOSTS: the hosts a pasted pairing URL may
+	// point at when InternalURL is empty. "*.example.org" allows every
+	// subdomain of example.org. In development DevAllowedHosts are added.
+	AllowedHosts []string
+	// EncryptionKey is DEN_LINK_ENCRYPTION_KEY, base64 of 32 bytes. The
+	// stored credential is encrypted with it (AES-256-GCM). Required unless
+	// AppEnv is development.
+	EncryptionKey string
+	// PreviousEncryptionKey is DEN_LINK_ENCRYPTION_KEY_PREVIOUS, accepted
+	// for reading during a key rotation; values are re-encrypted with
+	// EncryptionKey on read.
+	PreviousEncryptionKey string
+}
+
+// FromEnv reads DEN_MODE, DEN_INTERNAL_URL, DEN_ALLOWED_HOSTS,
+// DEN_LINK_ENCRYPTION_KEY, DEN_LINK_ENCRYPTION_KEY_PREVIOUS and APP_ENV
+// through getenv (usually os.Getenv) and validates the result.
+func FromEnv(slug, version string, getenv func(string) string) (Config, error) {
+	c := Config{
+		Slug:                  slug,
+		Version:               version,
+		InternalURL:           strings.TrimSpace(getenv(EnvInternalURL)),
+		Mode:                  Mode(strings.TrimSpace(getenv(EnvMode))),
+		AppEnv:                NormalizeAppEnv(getenv(EnvAppEnv)),
+		AllowedHosts:          SplitHosts(getenv(EnvAllowedHosts)),
+		EncryptionKey:         getenv(EnvEncryptionKey),
+		PreviousEncryptionKey: getenv(EnvEncryptionKeyPrevious),
+	}
+	return c, c.Validate()
+}
+
+// SplitHosts parses a comma-separated DEN_ALLOWED_HOSTS value.
+func SplitHosts(s string) []string {
+	var out []string
+	for _, h := range strings.Split(s, ",") {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+func (c Config) development() bool { return NormalizeAppEnv(c.AppEnv) == "development" }
+
+// NormalizeAppEnv trims and lower-cases an APP_ENV value; empty becomes
+// production. authbase has an identical copy (the packages never import each
+// other), so both read APP_ENV the same way.
+func NormalizeAppEnv(s string) string {
+	if s = strings.ToLower(strings.TrimSpace(s)); s == "" {
+		return "production"
+	}
+	return s
+}
+
+// Validate checks the settings. Outside APP_ENV=development it requires
+// DEN_LINK_ENCRYPTION_KEY, so a module refuses to start without one.
+func (c Config) Validate() error {
+	if err := c.Mode.Validate(); err != nil {
+		return err
+	}
+	if _, err := newKeyring(c.EncryptionKey, c.PreviousEncryptionKey); err != nil {
+		return err
+	}
+	if !c.development() && strings.TrimSpace(c.EncryptionKey) == "" {
+		return fmt.Errorf("%s is required unless APP_ENV=development (generate one with: openssl rand -base64 32)", EnvEncryptionKey)
+	}
+	if c.InternalURL != "" {
+		u, err := url.Parse(c.InternalURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("%s must be an http(s) URL such as https://den-backend:8080, got %q", EnvInternalURL, c.InternalURL)
+		}
+	}
+	for _, h := range c.AllowedHosts {
+		if strings.Contains(h, "/") || strings.Contains(h, " ") || strings.Count(strings.TrimPrefix(h, "*."), "*") > 0 {
+			return fmt.Errorf("%s: %q is not a host name (use den.example.org or *.example.org, no scheme or path)", EnvAllowedHosts, h)
+		}
+	}
+	return nil
 }
 
 // Asset roles the module copies from Den and serves itself.
@@ -111,62 +241,134 @@ type asset struct {
 	ctype string
 }
 
+// db is the part of *pgxpool.Pool the Client uses.
+type db interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // Client is safe for concurrent use.
 type Client struct {
-	pool *pgxpool.Pool
+	pool db
 	cfg  Config
 	http *http.Client
 	log  zerolog.Logger
+	keys *keyring
+	// cfgErr is Config.Validate's result; Restore and Pair return it.
+	cfgErr error
 
 	mu     sync.RWMutex
 	bundle *Bundle
 	assets map[string]asset
-	// linked mirrors whether the den_link row exists.
-	linked bool
+	// linked mirrors whether the den_link row exists, revoked whether its
+	// revoked_at is set.
+	linked, revoked bool
 }
 
-// New returns a Client; call Run to start syncing.
+// New returns a Client; call Run to start syncing. An invalid cfg (see
+// Config.Validate) makes Restore and Pair fail; prefer Open, which reports
+// it straight away.
 func New(pool *pgxpool.Pool, cfg Config, log zerolog.Logger) *Client {
-	return &Client{pool: pool, cfg: cfg, http: &http.Client{Timeout: 30 * time.Second}, log: log, assets: map[string]asset{}}
+	c := &Client{
+		cfg: cfg, log: log, assets: map[string]asset{},
+		http: &http.Client{
+			Timeout: 30 * time.Second,
+			// A redirect could lead the pairing request to a host that
+			// AllowedHosts would refuse; Den's API never redirects.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}
+	if pool != nil {
+		c.pool = pool
+	}
+	c.cfgErr = cfg.Validate()
+	if c.cfgErr == nil {
+		c.keys, c.cfgErr = newKeyring(cfg.EncryptionKey, cfg.PreviousEncryptionKey)
+	}
+	if c.cfgErr == nil && c.keys == nil {
+		log.Warn().Msgf("den link: %s is not set; the Den credential is stored unencrypted (development only)", EnvEncryptionKey)
+	}
+	return c
+}
+
+// Open validates cfg and returns a Client. Call it at start-up and refuse
+// to start on error.
+func Open(pool *pgxpool.Pool, cfg Config, log zerolog.Logger) (*Client, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return New(pool, cfg, log), nil
 }
 
 // ErrNotPaired is returned when an operation needs a pairing.
 var ErrNotPaired = errors.New("not connected to Den")
 
+// ErrRevoked is returned when Den rejects the module's credential. The link
+// is marked revoked; an admin has to pair again.
+var ErrRevoked = errors.New("Den rejected this module's credential (revoked, or the module was removed in Den); pair again from Den → Modules → Pair")
+
 type link struct {
 	baseURL, credential, moduleID string
 	pairedAt                      time.Time
-	syncedAt                      *time.Time
+	syncedAt, revokedAt           *time.Time
 	lastError                     string
 	bundle                        []byte
 }
 
 func (c *Client) load(ctx context.Context) (*link, error) {
 	var l link
+	var stored string
 	err := c.pool.QueryRow(ctx, `
-		SELECT den_base_url, credential, module_id, paired_at, synced_at, last_error, bundle
-		  FROM den_link WHERE id = 1`).Scan(&l.baseURL, &l.credential, &l.moduleID, &l.pairedAt, &l.syncedAt, &l.lastError, &l.bundle)
+		SELECT den_base_url, credential, module_id, paired_at, synced_at, last_error, bundle, revoked_at
+		  FROM den_link WHERE id = 1`).Scan(&l.baseURL, &stored, &l.moduleID, &l.pairedAt, &l.syncedAt, &l.lastError, &l.bundle, &l.revokedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		c.setLinked(false)
+		c.setLinked(false, false)
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	c.setLinked(true)
+	c.setLinked(true, l.revokedAt != nil)
+	plain, rewrite, err := c.keys.open(stored)
+	if err != nil {
+		return nil, err
+	}
+	l.credential = plain
+	if rewrite {
+		c.reencrypt(ctx, stored, plain)
+	}
 	return &l, nil
 }
 
-func (c *Client) setLinked(v bool) {
+// reencrypt writes a plaintext or previous-key credential back sealed with
+// the current key. It only replaces the value it read, so a concurrent Pair
+// wins.
+func (c *Client) reencrypt(ctx context.Context, stored, plain string) {
+	sealed, err := c.keys.seal(plain)
+	if err == nil {
+		_, err = c.pool.Exec(ctx, `UPDATE den_link SET credential = $1 WHERE id = 1 AND credential = $2`, sealed, stored)
+	}
+	if err != nil {
+		c.log.Warn().Err(err).Msg("den link: re-encrypting the stored credential failed")
+		return
+	}
+	c.log.Info().Msg("den link: re-encrypted the stored credential with the current key")
+}
+
+func (c *Client) setLinked(linked, revoked bool) {
 	c.mu.Lock()
-	c.linked = v
+	c.linked, c.revoked = linked, linked && revoked
 	c.mu.Unlock()
 }
 
 // Restore loads the pairing state and the cached bundle from the database.
 // Call it before serving requests so RequirePaired sees the stored pairing;
-// Run calls it too.
+// Run calls it too. It fails when the Config is invalid or the stored
+// credential cannot be decrypted.
 func (c *Client) Restore(ctx context.Context) error {
+	if c.cfgErr != nil {
+		return c.cfgErr
+	}
 	l, err := c.load(ctx)
 	if err != nil {
 		return err
@@ -223,6 +425,33 @@ func (c *Client) Setting(key string) (value string, ok bool) {
 	return s, isStr
 }
 
+// BoolSetting returns a boolean org setting from Den. ok is false when the
+// module is standalone or Den does not set the key (then the module's own
+// value applies).
+func (c *Client) BoolSetting(key string) (value, ok bool) {
+	b := c.Bundle()
+	if b == nil {
+		return false, false
+	}
+	v, present := b.Settings.Data[key]
+	if !present {
+		return false, false
+	}
+	bv, isBool := v.(bool)
+	return bv, isBool
+}
+
+// ModuleSettings returns Den's module settings for this module, or nil
+// when the module is standalone or Den sends none. The result's methods
+// are safe on nil, so c.ModuleSettings().Days("wiki.revision_retention_days")
+// needs no check first. Do not modify it.
+func (c *Client) ModuleSettings() *ModuleSettings {
+	if b := c.Bundle(); b != nil {
+		return b.ModuleSettings
+	}
+	return nil
+}
+
 // OrganizationName is Den's resolved organisation name ("" when standalone).
 func (c *Client) OrganizationName() string {
 	if b := c.Bundle(); b != nil {
@@ -243,6 +472,14 @@ func (c *Client) Linked() bool {
 	return c.linked
 }
 
+// Revoked reports whether Den rejected the stored credential. It stays true
+// until an admin pairs again (or a later sync is accepted).
+func (c *Client) Revoked() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.revoked
+}
+
 // Status reports the pairing state.
 func (c *Client) Status(ctx context.Context) (Status, error) {
 	l, err := c.load(ctx)
@@ -250,19 +487,79 @@ func (c *Client) Status(ctx context.Context) (Status, error) {
 		return Status{}, err
 	}
 	pairedAt := l.pairedAt
-	return Status{Paired: true, DenBaseURL: l.baseURL, ModuleID: l.moduleID, PairedAt: &pairedAt, SyncedAt: l.syncedAt, LastError: l.lastError}, nil
+	return Status{
+		Paired: true, DenBaseURL: l.baseURL, ModuleID: l.moduleID, PairedAt: &pairedAt, SyncedAt: l.syncedAt,
+		LastError: l.lastError, Revoked: l.revokedAt != nil, RevokedAt: l.revokedAt,
+	}, nil
 }
 
-// Pair redeems a pairing URL from Den and syncs right away.
-func (c *Client) Pair(ctx context.Context, pairingURL string) (Status, error) {
+// HostAllowed reports whether a pairing URL may point at host (no port)
+// when InternalURL is empty.
+func (c Config) HostAllowed(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.Trim(host, "[]")), ".")
+	if host == "" {
+		return false
+	}
+	patterns := c.AllowedHosts
+	if c.development() {
+		patterns = append(append([]string{}, DevAllowedHosts...), patterns...)
+	}
+	for _, p := range patterns {
+		p = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(p)), ".")
+		if suffix, ok := strings.CutPrefix(p, "*."); ok {
+			if strings.HasSuffix(host, "."+suffix) {
+				return true
+			}
+			continue
+		}
+		if ip := net.ParseIP(p); ip != nil {
+			if hip := net.ParseIP(host); hip != nil && hip.Equal(ip) {
+				return true
+			}
+			continue
+		}
+		if host == p {
+			return true
+		}
+	}
+	return false
+}
+
+// pairTarget checks a pasted pairing URL and returns the URL to redeem.
+func (c *Client) pairTarget(pairingURL string) (*url.URL, error) {
 	u, err := url.Parse(strings.TrimSpace(pairingURL))
 	if err != nil || u.Scheme == "" || u.Host == "" || u.Query().Get("token") == "" {
-		return Status{}, errors.New("paste the full pairing URL from Den (Admin → Modules → Pair)")
+		return nil, errors.New("paste the full pairing URL from Den (Admin → Modules → Pair)")
 	}
 	if c.cfg.InternalURL != "" {
-		if iu, err := url.Parse(c.cfg.InternalURL); err == nil {
-			u.Scheme, u.Host = iu.Scheme, iu.Host
+		iu, err := url.Parse(c.cfg.InternalURL)
+		if err != nil {
+			return nil, fmt.Errorf("%s is invalid", EnvInternalURL)
 		}
+		u.Scheme, u.Host = iu.Scheme, iu.Host
+		return u, nil
+	}
+	switch {
+	case u.Scheme == "https":
+	case u.Scheme == "http" && c.cfg.development():
+	default:
+		return nil, errors.New("the pairing URL must start with https://")
+	}
+	if !c.cfg.HostAllowed(u.Hostname()) {
+		return nil, fmt.Errorf("pairing with Den at %s is not allowed here; add the host to %s or set %s", u.Hostname(), EnvAllowedHosts, EnvInternalURL)
+	}
+	return u, nil
+}
+
+// Pair redeems a pairing URL from Den and syncs right away. It also clears
+// a revoked state.
+func (c *Client) Pair(ctx context.Context, pairingURL string) (Status, error) {
+	if c.cfgErr != nil {
+		return Status{}, c.cfgErr
+	}
+	u, err := c.pairTarget(pairingURL)
+	if err != nil {
+		return Status{}, err
 	}
 	body, _ := json.Marshal(map[string]string{"module_slug": c.cfg.Slug, "module_version": c.cfg.Version})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
@@ -282,19 +579,26 @@ func (c *Client) Pair(ctx context.Context, pairingURL string) (Status, error) {
 		Credential string `json:"credential"`
 		ModuleID   string `json:"module_id"`
 	}
-	if err := json.NewDecoder(res.Body).Decode(&out); err != nil || out.Credential == "" {
+	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<16)).Decode(&out); err != nil || out.Credential == "" {
 		return Status{}, errors.New("unexpected response from Den")
+	}
+	stored := out.Credential
+	if c.keys != nil {
+		if stored, err = c.keys.seal(out.Credential); err != nil {
+			return Status{}, err
+		}
 	}
 	base := u.Scheme + "://" + u.Host
 	if _, err := c.pool.Exec(ctx, `
 		INSERT INTO den_link (id, den_base_url, credential, module_id, paired_at)
 		VALUES (1, $1, $2, $3, now())
 		ON CONFLICT (id) DO UPDATE SET den_base_url = EXCLUDED.den_base_url, credential = EXCLUDED.credential,
-		       module_id = EXCLUDED.module_id, paired_at = now(), synced_at = NULL, last_error = '', bundle = NULL`,
-		base, out.Credential, out.ModuleID); err != nil {
+		       module_id = EXCLUDED.module_id, paired_at = now(), synced_at = NULL, last_error = '', bundle = NULL,
+		       revoked_at = NULL`,
+		base, stored, out.ModuleID); err != nil {
 		return Status{}, err
 	}
-	c.setLinked(true)
+	c.setLinked(true, false)
 	if err := c.Sync(ctx); err != nil {
 		c.log.Warn().Err(err).Msg("den link: first sync failed")
 	}
@@ -307,13 +611,13 @@ func (c *Client) Unpair(ctx context.Context) error {
 		return err
 	}
 	c.mu.Lock()
-	c.bundle, c.assets, c.linked = nil, map[string]asset{}, false
+	c.bundle, c.assets, c.linked, c.revoked = nil, map[string]asset{}, false, false
 	c.mu.Unlock()
 	return nil
 }
 
 // Sync pulls the bundle (and the logo and login background when they
-// changed) from Den.
+// changed) from Den. A successful sync clears a revoked state.
 func (c *Client) Sync(ctx context.Context) error {
 	l, err := c.load(ctx)
 	if err != nil {
@@ -332,13 +636,26 @@ func (c *Client) Sync(ctx context.Context) error {
 		_, _ = c.pool.Exec(ctx, `UPDATE den_link SET last_error = $1 WHERE id = 1`, err.Error())
 		return err
 	}
-	if _, err := c.pool.Exec(ctx, `UPDATE den_link SET bundle = $1, synced_at = now(), last_error = '' WHERE id = 1`, raw); err != nil {
+	if _, err := c.pool.Exec(ctx, `UPDATE den_link SET bundle = $1, synced_at = now(), last_error = '', revoked_at = NULL WHERE id = 1`, raw); err != nil {
 		return err
 	}
 	c.mu.Lock()
-	c.bundle = b
+	c.bundle, c.revoked = b, false
 	c.mu.Unlock()
 	return nil
+}
+
+// markRevoked records that Den rejected the credential. It never re-pairs.
+func (c *Client) markRevoked(ctx context.Context) {
+	if _, err := c.pool.Exec(ctx, `UPDATE den_link SET revoked_at = COALESCE(revoked_at, now()), last_error = $1 WHERE id = 1`, ErrRevoked.Error()); err != nil {
+		c.log.Warn().Err(err).Msg("den link: could not record the revoked credential")
+	}
+	c.mu.Lock()
+	if c.linked && !c.revoked {
+		c.log.Warn().Msg("den link: Den rejected the module credential; an admin must pair again")
+	}
+	c.revoked = c.linked
+	c.mu.Unlock()
 }
 
 func (c *Client) get(ctx context.Context, l *link, path string) (*http.Response, error) {
@@ -368,7 +685,8 @@ func (c *Client) send(ctx context.Context, l *link, method, path string, body an
 	}
 	if res.StatusCode == http.StatusUnauthorized {
 		_ = res.Body.Close()
-		return nil, errors.New("Den rejected this module's credential (revoked?); pair again")
+		c.markRevoked(ctx)
+		return nil, ErrRevoked
 	}
 	if res.StatusCode != http.StatusOK {
 		defer func() { _ = res.Body.Close() }()
@@ -501,8 +819,7 @@ func (c *Client) PreferencesHandler(identity Identity) http.HandlerFunc {
 		var in struct {
 			Theme string `json:"theme"`
 		}
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&in); err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+		if !decodeBody(w, r, &in) {
 			return
 		}
 		switch in.Theme {
@@ -613,17 +930,23 @@ func (c *Client) AssetHandler(w http.ResponseWriter, r *http.Request) {
 type State struct {
 	Mode   Mode `json:"mode"`
 	Paired bool `json:"paired"`
+	// Revoked is true when Den rejected the stored credential: the web app
+	// tells the module's admins to pair again.
+	Revoked bool `json:"revoked"`
 }
 
 // StateHandler serves State without authentication so a frontend can show
-// a "waiting for Den" screen before anyone signs in.
+// a "waiting for Den" or "pair again" screen before anyone signs in.
 func (c *Client) StateHandler(w http.ResponseWriter, r *http.Request) {
 	mode := c.cfg.Mode
 	if mode == "" {
 		mode = ModeStandalone
 	}
+	c.mu.RLock()
+	st := State{Mode: mode, Paired: c.linked, Revoked: c.revoked}
+	c.mu.RUnlock()
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, State{Mode: mode, Paired: c.Linked()})
+	writeJSON(w, http.StatusOK, st)
 }
 
 // pairingExempt are the API paths (and everything below them) that stay
@@ -653,7 +976,8 @@ func isPairingExempt(path string) bool {
 
 // RequirePaired answers 503 den_pairing_required while Mode is required and
 // the module is not paired, except for the paths in pairingExempt. Mount it
-// first on the module's /api router.
+// first on the module's /api router. A revoked link still counts as paired
+// (the module keeps its last bundle); StateHandler reports it.
 func (c *Client) RequirePaired(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if c.cfg.Mode != ModeRequired || c.Linked() || isPairingExempt(r.URL.Path) {
@@ -679,8 +1003,7 @@ func (c *Client) PairHandler(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		PairingURL string `json:"pairing_url"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&in); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+	if !decodeBody(w, r, &in) {
 		return
 	}
 	s, err := c.Pair(r.Context(), in.PairingURL)
@@ -694,8 +1017,12 @@ func (c *Client) PairHandler(w http.ResponseWriter, r *http.Request) {
 func (c *Client) SyncHandler(w http.ResponseWriter, r *http.Request) {
 	if err := c.Sync(r.Context()); err != nil {
 		code := http.StatusBadGateway
-		if errors.Is(err, ErrNotPaired) {
+		switch {
+		case errors.Is(err, ErrNotPaired):
 			code = http.StatusConflict
+		case errors.Is(err, ErrRevoked):
+			writeError(w, http.StatusConflict, "den_credential_revoked", err.Error())
+			return
 		}
 		writeError(w, code, "sync_failed", err.Error())
 		return
@@ -709,6 +1036,35 @@ func (c *Client) UnpairHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// maxRequestBody limits the bodies of denlink's own handlers (a pairing URL
+// or a theme).
+const maxRequestBody = 64 << 10
+
+// decodeBody reads one JSON value of at most maxRequestBody bytes into dst
+// and answers like authbase.DecodeJSON: 413 request_too_large or 400
+// bad_request. It is a copy rather than a call because a module may adopt
+// denlink without authbase, and the shared packages never import each
+// other. It reports whether dst was filled.
+func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	err := dec.Decode(dst)
+	if err == nil {
+		if err = dec.Decode(&struct{}{}); errors.Is(err, io.EOF) {
+			return true
+		}
+		if err == nil {
+			err = errors.New("more than one JSON value")
+		}
+	}
+	var tooBig *http.MaxBytesError
+	if errors.As(err, &tooBig) {
+		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", fmt.Sprintf("request body is larger than %d bytes", maxRequestBody))
+		return false
+	}
+	writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

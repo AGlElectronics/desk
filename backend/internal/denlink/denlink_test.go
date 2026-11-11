@@ -1,3 +1,5 @@
+// Code generated from con-services shared/go/denlink; DO NOT EDIT. Run scripts/sync-shared.
+
 package denlink
 
 import (
@@ -12,7 +14,7 @@ import (
 
 func newTestClient(mode Mode, linked bool) *Client {
 	c := New(nil, Config{Slug: "test", Mode: mode}, zerolog.Nop())
-	c.setLinked(linked)
+	c.setLinked(linked, false)
 	return c
 }
 
@@ -106,25 +108,40 @@ func TestRequirePairedPairedPasses(t *testing.T) {
 	}
 }
 
+func TestRequirePairedRevokedStillPasses(t *testing.T) {
+	c := newTestClient(ModeRequired, true)
+	c.setLinked(true, true)
+	if rec := serve(c, "/api/items"); rec.Code != http.StatusOK {
+		t.Errorf("status %d, want 200", rec.Code)
+	}
+}
+
 func TestStateHandler(t *testing.T) {
 	cases := []struct {
-		mode   Mode
-		linked bool
-		want   string
+		mode            Mode
+		linked, revoked bool
+		want            string
 	}{
-		{ModeRequired, false, `{"mode":"required","paired":false}`},
-		{ModeRequired, true, `{"mode":"required","paired":true}`},
-		{ModeStandalone, false, `{"mode":"standalone","paired":false}`},
-		{"", true, `{"mode":"standalone","paired":true}`},
+		{ModeRequired, false, false, `{"mode":"required","paired":false,"revoked":false}`},
+		{ModeRequired, true, false, `{"mode":"required","paired":true,"revoked":false}`},
+		{ModeStandalone, false, false, `{"mode":"standalone","paired":false,"revoked":false}`},
+		{"", true, false, `{"mode":"standalone","paired":true,"revoked":false}`},
+		{ModeRequired, true, true, `{"mode":"required","paired":true,"revoked":true}`},
+		{ModeRequired, false, true, `{"mode":"required","paired":false,"revoked":false}`},
 	}
 	for _, tc := range cases {
 		rec := httptest.NewRecorder()
-		newTestClient(tc.mode, tc.linked).StateHandler(rec, httptest.NewRequest(http.MethodGet, "/api/den/state", nil))
+		c := newTestClient(tc.mode, tc.linked)
+		c.setLinked(tc.linked, tc.revoked)
+		c.StateHandler(rec, httptest.NewRequest(http.MethodGet, "/api/den/state", nil))
 		if rec.Code != http.StatusOK {
 			t.Errorf("%+v: status %d", tc, rec.Code)
 		}
 		if got := strings.TrimSpace(rec.Body.String()); got != tc.want {
 			t.Errorf("%+v: body %s, want %s", tc, got, tc.want)
+		}
+		if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("Cache-Control %q", cc)
 		}
 	}
 }
