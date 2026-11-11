@@ -7,7 +7,8 @@ import { DenConnection } from '@/components/DenConnection';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import { useBrand } from '@/brand/BrandProvider';
 import { isDenPairingRequired, useDenState } from '@/hooks/useDenState';
-import { useMe, PERMS } from '@/hooks/useMe';
+import { useMe, PERMS, type MeHook } from '@/hooks/useMe';
+import { ShortcutHelp } from '@/components/ShortcutHelp';
 import { useThemeSync } from '@/lib/theme';
 import { cn } from '@/lib/utils';
 
@@ -15,13 +16,13 @@ type NavItem = {
   to: string;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
-  perms: string[]; // empty = always visible
+  visible: (me: MeHook) => boolean;
 };
 
 const NAV: NavItem[] = [
-  { to: '/inbox', label: 'Inbox', icon: Inbox, perms: [PERMS.ticketsWork] },
-  { to: '/mailboxes', label: 'Mailboxes', icon: Mail, perms: [PERMS.mailboxManage] },
-  { to: '/settings', label: 'Settings', icon: Settings, perms: [PERMS.settingsManage] },
+  { to: '/inbox', label: 'Inbox', icon: Inbox, visible: () => true },
+  { to: '/mailboxes', label: 'Mailboxes', icon: Mail, visible: (m) => m.isAdmin || m.worksAny },
+  { to: '/settings', label: 'Settings', icon: Settings, visible: () => true },
 ];
 
 function Wordmark() {
@@ -51,12 +52,11 @@ function Wordmark() {
 
 function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const { canAny } = useMe();
+  const me = useMe();
   return (
     <div className="space-y-0.5">
       {NAV.map((item) => {
-        const visible = item.perms.length === 0 || canAny(...item.perms);
-        if (!visible) return null;
+        if (!item.visible(me)) return null;
         const isActive =
           pathname === item.to || (item.to !== '/' && pathname.startsWith(item.to + '/'));
         return (
@@ -216,6 +216,7 @@ export function Layout() {
       <main className="flex-1 min-w-0 min-h-0 flex flex-col w-full md:min-h-screen">
         <Outlet />
       </main>
+      <ShortcutHelp />
     </div>
   );
 }

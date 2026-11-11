@@ -9,6 +9,7 @@ import {
 import { Layout } from '@/components/Layout';
 import type { Folder } from '@/api/desk';
 import { ConversationPage } from '@/pages/ConversationPage';
+import { CustomerPage } from '@/pages/CustomerPage';
 import { InboxPage } from '@/pages/InboxPage';
 import { LoginPage } from '@/pages/LoginPage';
 import { MailboxesPage } from '@/pages/MailboxesPage';
@@ -33,9 +34,9 @@ async function requireAuth(fullPath: string) {
   }
 }
 
-const FOLDERS: Folder[] = ['unassigned', 'mine', 'assigned', 'pending', 'closed', 'spam', 'all'];
+const FOLDERS: Folder[] = ['unassigned', 'mine', 'assigned', 'pending', 'closed', 'spam', 'all', 'starred', 'trash'];
 
-export type InboxSearch = { mailbox?: string; folder?: Folder; q?: string };
+export type InboxSearch = { mailbox?: string; folder?: Folder; q?: string; tag?: string };
 
 const rootRoute = createRootRoute({
   component: () => <Outlet />,
@@ -79,8 +80,16 @@ export const inboxRoute = createRoute({
     mailbox: typeof search.mailbox === 'string' ? search.mailbox : undefined,
     folder: FOLDERS.includes(search.folder as Folder) ? (search.folder as Folder) : undefined,
     q: typeof search.q === 'string' && search.q ? search.q : undefined,
+    tag: typeof search.tag === 'string' && search.tag ? search.tag : undefined,
   }),
   component: InboxPage,
+});
+
+const customerRoute = createRoute({
+  getParentRoute: () => appLayoutRoute,
+  path: '/customers/$customerId',
+  beforeLoad: ({ location }) => requireAuth(location.pathname),
+  component: CustomerPage,
 });
 
 export const conversationRoute = createRoute({
@@ -107,7 +116,7 @@ const settingsRoute = createRoute({
 const routeTree = rootRoute.addChildren([
   loginRoute,
   authCallbackRoute,
-  appLayoutRoute.addChildren([indexRoute, inboxRoute, conversationRoute, mailboxesRoute, settingsRoute]),
+  appLayoutRoute.addChildren([indexRoute, inboxRoute, conversationRoute, customerRoute, mailboxesRoute, settingsRoute]),
 ]);
 
 export const router = createRouter({ routeTree });

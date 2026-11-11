@@ -1,8 +1,7 @@
-// Typed fetch wrapper. The backend speaks the same error shape as Stash
-// ({"error":{"code","message","details"}}), so this file is a near-copy of
-// the Stash client with the dev-user header normalized to work for Desk
-// too. The auth-headers resolver is injected at startup from
-// src/auth/installAuth.ts.
+// Typed fetch wrapper for Desk's API. Errors come back as
+// {"error":{"code","message","details"}}; anything else (a proxy's HTML
+// error page, an empty body) becomes an ApiError with the HTTP status. The
+// auth-headers resolver is installed at startup by src/auth/installAuth.ts.
 
 import { runtimeConfig } from '@/runtime-config';
 
@@ -29,6 +28,24 @@ export class ApiError extends Error {
     this.code = body.error.code;
     this.details = body.error.details;
   }
+
+  /** Field messages of a validation error ({"field": "message"}). */
+  fields(): Record<string, string> {
+    return this.details && typeof this.details === 'object' ? (this.details as Record<string, string>) : {};
+  }
+}
+
+/** Turns any response body into the error shape. */
+export function toErrorBody(status: number, text: string): ApiErrorBody {
+  try {
+    const parsed = JSON.parse(text) as Partial<ApiErrorBody>;
+    if (parsed && parsed.error && typeof parsed.error.message === 'string') {
+      return parsed as ApiErrorBody;
+    }
+  } catch {
+    // not JSON: fall through
+  }
+  return { error: { code: `http_${status}`, message: `The server answered ${status}${text ? '' : ' without details'}.` } };
 }
 
 type AuthHeaders = Record<string, string>;
@@ -61,7 +78,7 @@ export async function apiRequest<T>(path: string, opts: RequestOpts = {}): Promi
   );
   if (opts.query) {
     for (const [k, v] of Object.entries(opts.query)) {
-      if (v === undefined || v === null) continue;
+      if (v === undefined || v === null || v === '') continue;
       url.searchParams.set(k, String(v));
     }
   }
@@ -82,33 +99,25 @@ export async function apiRequest<T>(path: string, opts: RequestOpts = {}): Promi
     credentials: 'include',
   });
 
-  if (res.status === 401) {
-
-    unauthorizedHandler?.();
-
-  }
-
-  if (res.status === 204) {
-    return undefined as T;
-  }
+  if (res.status === 401) unauthorizedHandler?.();
+  if (res.status === 204) return undefined as T;
 
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
+  if (!res.ok) throw new ApiError(res.status, toErrorBody(res.status, text));
+  return (text ? JSON.parse(text) : null) as T;
+}
 
-  if (!res.ok) {
-    throw new ApiError(res.status, data as ApiErrorBody);
-  }
-  return data as T;
+/** Fetches an authenticated file as a Blob. */
+export async function apiBlob(path: string, signal?: AbortSignal): Promise<Blob> {
+  const auth = await authHeadersResolver();
+  const res = await fetch(`${apiBaseUrl()}${path}`, { headers: auth, credentials: 'include', signal });
+  if (!res.ok) throw new ApiError(res.status, toErrorBody(res.status, await res.text()));
+  return res.blob();
 }
 
 /** Downloads an authenticated file and hands it to the browser as filename. */
 export async function apiDownload(path: string, filename: string): Promise<void> {
-  const auth = await authHeadersResolver();
-  const res = await fetch(`${apiBaseUrl()}${path}`, { headers: auth, credentials: 'include' });
-  if (!res.ok) {
-    throw new Error(`Download failed (${res.status})`);
-  }
-  const url = URL.createObjectURL(await res.blob());
+  const url = URL.createObjectURL(await apiBlob(path));
   const a = document.createElement('a');
   a.href = url;
   a.download = filename;
