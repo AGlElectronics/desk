@@ -25,6 +25,7 @@ import (
 	"github.com/AGlElectronics/desk/backend/internal/denlink"
 	"github.com/AGlElectronics/desk/backend/internal/desk"
 	httpx "github.com/AGlElectronics/desk/backend/internal/http"
+	"github.com/AGlElectronics/desk/backend/internal/mailprovider"
 	"github.com/AGlElectronics/desk/backend/internal/secretbox"
 	"github.com/AGlElectronics/desk/backend/internal/tlscert"
 )
@@ -105,6 +106,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	var workers sync.WaitGroup
 	workers.Go(func() { deskSvc.RunFetcher(workCtx, cfg.FetchInterval, logger) })
 	workers.Go(func() { deskSvc.RunSender(workCtx, logger) })
+	workers.Go(func() { deskSvc.RunMaintenance(workCtx, logger) })
 	stopWorkers := func() {
 		stopWork()
 		workers.Wait()
@@ -148,8 +150,15 @@ func newDeskService(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config)
 	if err != nil {
 		return nil, fmt.Errorf("object storage: %w", err)
 	}
+	google, err := googleOptions(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
 	return desk.NewService(pool, desk.Options{
-		Blobs:   blobs,
+		Blobs:      blobs,
+		Google:     google,
+		NotifyFrom: cfg.NotifyFrom,
+		BaseURL:    cfg.AppBaseURL,
 		Keyring: keys,
 		SMTP: desk.SMTPSettings{
 			Host: cfg.SMTPHost, Port: cfg.SMTPPort, Security: cfg.SMTPSecurity,
@@ -158,6 +167,36 @@ func newDeskService(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config)
 		Development:      cfg.IsDevelopment(),
 		AllowedMailHosts: cfg.AllowedMailHosts,
 	}), nil
+}
+
+// GoogleProvider builds the Google Workspace client (Gmail API and Admin
+// SDK with domain-wide delegation) from GOOGLE_*. This version of Desk
+// ships without one; the client from shared/go/gworkspace sets it.
+var GoogleProvider func(ctx context.Context, cfg *config.Config) (mailprovider.Provider, error)
+
+func googleOptions(ctx context.Context, cfg *config.Config) (*desk.GoogleOptions, error) {
+	if !cfg.GoogleEnabled() {
+		return nil, nil
+	}
+	opts := &desk.GoogleOptions{Domain: cfg.GoogleDomain, SharedMailbox: cfg.GoogleSharedMailbox, Label: cfg.GoogleLabel}
+	switch {
+	case cfg.GoogleFake:
+		fake := mailprovider.NewFake()
+		if cfg.GoogleSharedMailbox != "" {
+			fake.AddUser(cfg.GoogleSharedMailbox)
+		}
+		opts.Provider = fake
+	case GoogleProvider != nil:
+		p, err := GoogleProvider(ctx, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("google workspace: %w", err)
+		}
+		opts.Provider = p
+	default:
+		return nil, errors.New("GOOGLE_WORKSPACE_DOMAIN is set, but this build of Desk has no Google Workspace client yet; " +
+			"unset it to use IMAP/SMTP mailboxes, or GOOGLE_FAKE=true to try the flow in development")
+	}
+	return opts, nil
 }
 
 // Reencrypt seals every stored mailbox password under the current

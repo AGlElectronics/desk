@@ -48,6 +48,12 @@ type Options struct {
 	AllowedMailHosts []string
 	// Blobs stores attachments and raw mail (S3).
 	Blobs blob.Store
+	// Google turns on the Google Workspace connectors (nil: IMAP only).
+	Google *GoogleOptions
+	// NotifyFrom is the From of Desk's own emails ("" = none are sent).
+	NotifyFrom string
+	// BaseURL is the web app address used in links in Desk's emails.
+	BaseURL string
 }
 
 // Service is safe for concurrent use.
@@ -58,6 +64,10 @@ type Service struct {
 	dev   bool
 	guard *netguard.Guard
 	blobs blob.Store
+	// google is nil when Google Workspace is not configured.
+	google     *GoogleOptions
+	notifyFrom string
+	baseURL    string
 	// fetchInterval is the polling interval back-off starts from.
 	fetchInterval time.Duration
 	// fetchNow wakes the fetcher early ("Fetch now" in the UI).
@@ -72,10 +82,16 @@ func NewService(pool *pgxpool.Pool, opts Options) *Service {
 	if opts.Blobs == nil {
 		opts.Blobs = blob.NewMemory()
 	}
+	if opts.Google != nil && opts.Google.Label == "" {
+		opts.Google.Label = "Desk"
+	}
 	return &Service{
 		pool: pool, keys: opts.Keyring, smtp: opts.SMTP, dev: opts.Development,
 		guard:         netguard.New(opts.AllowedMailHosts),
 		blobs:         opts.Blobs,
+		google:        opts.Google,
+		notifyFrom:    opts.NotifyFrom,
+		baseURL:       strings.TrimRight(opts.BaseURL, "/"),
 		fetchInterval: time.Minute,
 		fetchNow:      make(chan uuid.UUID, 16),
 	}
@@ -196,7 +212,13 @@ type Mailbox struct {
 	LastFetchError  string     `json:"last_fetch_error"`
 	FetchFailures   int        `json:"fetch_failures"`
 	NextFetchAt     *time.Time `json:"next_fetch_at,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
+	// Connector: imap | google_user | google_group (docs/adr/0001).
+	Connector     string     `json:"connector"`
+	ProviderState string     `json:"provider_state"`
+	ProviderError string     `json:"provider_error"`
+	DeletedAt     *time.Time `json:"deleted_at,omitempty"`
+	PurgeAfter    *time.Time `json:"purge_after,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
 
 	imapPasswordEnc string
 	smtpPasswordEnc string
@@ -225,6 +247,7 @@ const mailboxCols = `id, organization_id, name, email::text, signature,
 	imap_host, imap_port, imap_security, imap_username, imap_password_enc,
 	smtp_host, smtp_port, smtp_security, smtp_username, smtp_password_enc,
 	imap_move_to, last_fetch_at, last_fetch_error, fetch_failures, next_fetch_at,
+	connector, provider_state, provider_error, deleted_at, purge_after,
 	created_at, last_uid, uid_validity`
 
 func scanMailbox(row pgx.Row) (Mailbox, error) {
@@ -234,6 +257,7 @@ func scanMailbox(row pgx.Row) (Mailbox, error) {
 		&m.IMAPHost, &m.IMAPPort, &m.IMAPSecurity, &m.IMAPUsername, &m.imapPasswordEnc,
 		&m.SMTPHost, &m.SMTPPort, &m.SMTPSecurity, &m.SMTPUsername, &m.smtpPasswordEnc,
 		&m.IMAPMoveTo, &m.LastFetchAt, &m.LastFetchError, &m.FetchFailures, &m.NextFetchAt,
+		&m.Connector, &m.ProviderState, &m.ProviderError, &m.DeletedAt, &m.PurgeAfter,
 		&m.CreatedAt, &lastUID, &uidValidity)
 	m.IMAPPasswordSet = m.imapPasswordEnc != ""
 	m.SMTPPasswordSet = m.smtpPasswordEnc != ""
@@ -253,7 +277,7 @@ func (s *Service) GetMailbox(ctx context.Context, id uuid.UUID) (Mailbox, error)
 
 // ListMailboxes returns every mailbox with folder counts for userID.
 func (s *Service) ListMailboxes(ctx context.Context, userID uuid.UUID) ([]MailboxWithCounts, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+mailboxCols+` FROM mailboxes ORDER BY name`)
+	rows, err := s.pool.Query(ctx, `SELECT `+mailboxCols+` FROM mailboxes WHERE deleted_at IS NULL ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -294,6 +318,9 @@ func (s *Service) ListMailboxes(ctx context.Context, userID uuid.UUID) ([]Mailbo
 // MailboxInput creates or updates a mailbox. Nil fields are left unchanged
 // on update; a nil password keeps the stored one, "" clears it.
 type MailboxInput struct {
+	// Connector is set on create only: imap (default), google_user or
+	// google_group.
+	Connector    *string `json:"connector"`
 	Name         *string `json:"name"`
 	Email        *string `json:"email"`
 	Signature    *string `json:"signature"`
@@ -352,6 +379,37 @@ func (s *Service) validateMailbox(in *MailboxInput, create bool) map[string]stri
 			issues["email"] = "must be a plain email address"
 		}
 	}
+	if in.Connector != nil && !create {
+		issues["connector"] = "cannot be changed; create a new mailbox instead"
+	}
+	connector := ConnectorIMAP
+	if in.Connector != nil {
+		connector = *in.Connector
+	}
+	switch connector {
+	case ConnectorIMAP:
+	case ConnectorGoogleUser, ConnectorGoogleGroup:
+		switch {
+		case s.google == nil:
+			issues["connector"] = "Google Workspace is not configured (GOOGLE_WORKSPACE_DOMAIN)"
+		case connector == ConnectorGoogleGroup && s.google.SharedMailbox == "":
+			issues["connector"] = "group mailboxes need GOOGLE_SHARED_MAILBOX"
+		case in.Email != nil && !strings.HasSuffix(strings.ToLower(strings.TrimSpace(*in.Email)), "@"+s.google.Domain):
+			issues["email"] = "must be an address in " + s.google.Domain
+		case in.Email != nil && s.google.SharedMailbox != "" && strings.EqualFold(strings.TrimSpace(*in.Email), s.google.SharedMailbox):
+			issues["email"] = "is the shared account itself; choose another address"
+		}
+		for field, v := range map[string]bool{
+			"imap_host": in.IMAPHost != nil, "imap_username": in.IMAPUsername != nil, "imap_password": in.IMAPPassword != nil,
+			"smtp_host": in.SMTPHost != nil, "smtp_username": in.SMTPUsername != nil, "smtp_password": in.SMTPPassword != nil,
+		} {
+			if v && create {
+				issues[field] = "not used by Google Workspace mailboxes"
+			}
+		}
+	default:
+		issues["connector"] = "must be imap, google_user or google_group"
+	}
 	set("imap_security", s.checkSecurity(in.IMAPSecurity))
 	set("smtp_security", s.checkSecurity(in.SMTPSecurity))
 	set("imap_port", checkPort(in.IMAPPort))
@@ -379,24 +437,34 @@ func (s *Service) CreateMailbox(ctx context.Context, orgID uuid.UUID, in Mailbox
 		return Mailbox{}, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	connector, state := ConnectorIMAP, ""
+	if in.Connector != nil && *in.Connector != ConnectorIMAP {
+		connector, state = *in.Connector, "provisioning"
+	}
 	var id uuid.UUID
 	err = tx.QueryRow(ctx, `
-		INSERT INTO mailboxes (organization_id, name, email) VALUES ($1, $2, $3) RETURNING id
-	`, orgID, strings.TrimSpace(*in.Name), strings.TrimSpace(*in.Email)).Scan(&id)
+		INSERT INTO mailboxes (organization_id, name, email, connector, provider_state) VALUES ($1, $2, $3, $4, $5) RETURNING id
+	`, orgID, strings.TrimSpace(*in.Name), strings.ToLower(strings.TrimSpace(*in.Email)), connector, state).Scan(&id)
 	if err != nil {
 		if isUniqueViolation(err) {
-			return Mailbox{}, httperror.Conflict("a mailbox with this email address already exists")
+			return Mailbox{}, httperror.Conflict("a mailbox with this email address already exists (also in Desk's trash)")
 		}
 		return Mailbox{}, err
 	}
-	in.Name, in.Email = nil, nil
+	in.Name, in.Email, in.Connector = nil, nil, nil
 	if err := s.applyMailboxInput(ctx, tx, Mailbox{ID: id}, in); err != nil {
 		return Mailbox{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Mailbox{}, err
 	}
-	return s.GetMailbox(ctx, id)
+	mb, err := s.GetMailbox(ctx, id)
+	if err != nil || connector == ConnectorIMAP {
+		return mb, err
+	}
+	// The row exists first, so a failed Google call leaves a mailbox the
+	// admin can see, fix and provision again.
+	return s.Provision(ctx, mb)
 }
 
 // UpdateMailbox applies the non-nil fields of in.
@@ -515,18 +583,6 @@ func (s *Service) applyMailboxInput(ctx context.Context, tx pgx.Tx, cur Mailbox,
 			return httperror.Conflict("a mailbox with this email address already exists")
 		}
 		return err
-	}
-	return nil
-}
-
-// DeleteMailbox removes a mailbox and every conversation in it.
-func (s *Service) DeleteMailbox(ctx context.Context, id uuid.UUID) error {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM mailboxes WHERE id = $1`, id)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return httperror.NotFound("mailbox")
 	}
 	return nil
 }

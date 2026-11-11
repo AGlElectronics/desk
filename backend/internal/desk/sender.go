@@ -58,6 +58,7 @@ func (s *Service) RunSender(ctx context.Context, logger zerolog.Logger) {
 			return
 		case <-ticker.C:
 			s.sendDue(ctx, log)
+			s.sendOutbox(ctx, log)
 		}
 	}
 }
@@ -159,6 +160,9 @@ func (s *Service) sendReply(ctx context.Context, threadID uuid.UUID, log zerolog
 	mb, err := s.GetMailbox(ctx, c.MailboxID)
 	if err != nil {
 		return "", err
+	}
+	if mb.DeletedAt != nil {
+		return "", displayError{msg: "the mailbox is in the trash"}
 	}
 
 	out := outgoing{
@@ -271,7 +275,12 @@ func (s *Service) loadAttachments(ctx context.Context, threadID uuid.UUID) ([]ou
 type transport func(ctx context.Context, mb Mailbox, raw []byte) (string, error)
 
 // transportFor returns the provider transport of a mailbox, or nil for SMTP.
-func (s *Service) transportFor(Mailbox) transport { return nil }
+func (s *Service) transportFor(mb Mailbox) transport {
+	if mb.IsGoogle() {
+		return s.googleTransport
+	}
+	return nil
+}
 
 // deliver hands a finished message to the mailbox's transport.
 func (s *Service) deliver(ctx context.Context, mb Mailbox, rcpts []string, raw []byte, log zerolog.Logger) (string, error) {

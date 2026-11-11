@@ -49,7 +49,11 @@ func (s *Service) RunFetcher(ctx context.Context, interval time.Duration, logger
 			s.fetchAll(ctx, log)
 		case id := <-s.fetchNow:
 			mb, err := s.GetMailbox(ctx, id)
-			if err == nil {
+			switch {
+			case err != nil || mb.DeletedAt != nil:
+			case mb.Connector == ConnectorGoogleGroup:
+				s.fetchShared(ctx, log)
+			default:
 				s.fetchOne(ctx, mb, log)
 			}
 		}
@@ -57,8 +61,12 @@ func (s *Service) RunFetcher(ctx context.Context, interval time.Duration, logger
 }
 
 func (s *Service) fetchAll(ctx context.Context, log zerolog.Logger) {
+	s.fetchShared(ctx, log)
 	rows, err := s.pool.Query(ctx, `SELECT `+mailboxCols+` FROM mailboxes
-		 WHERE imap_host <> '' AND (next_fetch_at IS NULL OR next_fetch_at <= now()) ORDER BY name`)
+		 WHERE deleted_at IS NULL
+		   AND ((connector = 'imap' AND imap_host <> '') OR (connector = 'google_user' AND provider_state = 'active'))
+		   AND (next_fetch_at IS NULL OR next_fetch_at <= now())
+		 ORDER BY name`)
 	if err != nil {
 		if ctx.Err() == nil {
 			log.Error().Err(err).Msg("list mailboxes")
@@ -83,7 +91,7 @@ func (s *Service) fetchAll(ctx context.Context, log zerolog.Logger) {
 }
 
 func (s *Service) fetchOne(ctx context.Context, mb Mailbox, log zerolog.Logger) {
-	if mb.IMAPHost == "" {
+	if mb.Connector == ConnectorIMAP && mb.IMAPHost == "" {
 		return
 	}
 	imported, err := s.fetchMailbox(ctx, mb, log)
@@ -195,11 +203,19 @@ func (s *Service) dialIMAP(ctx context.Context, mb Mailbox) (*imapclient.Client,
 	return c, nil
 }
 
-// fetchMailbox imports messages above the stored UID, at most maxPerFetch
+// fetchMailbox imports new mail of one mailbox with its connector.
+func (s *Service) fetchMailbox(ctx context.Context, mb Mailbox, log zerolog.Logger) (int, error) {
+	if mb.Connector == ConnectorGoogleUser {
+		return s.fetchGoogleUser(ctx, mb, log)
+	}
+	return s.fetchIMAP(ctx, mb, log)
+}
+
+// fetchIMAP imports messages above the stored UID, at most maxPerFetch
 // per run, oldest first. Each handled message is marked \Seen (and moved
 // to the mailbox's "move to" folder when one is set); one that cannot be
 // imported is recorded in import_failures and skipped.
-func (s *Service) fetchMailbox(ctx context.Context, mb Mailbox, log zerolog.Logger) (int, error) {
+func (s *Service) fetchIMAP(ctx context.Context, mb Mailbox, log zerolog.Logger) (int, error) {
 	c, err := s.dialIMAP(ctx, mb)
 	if err != nil {
 		return 0, err
@@ -262,7 +278,7 @@ func (s *Service) fetchMailbox(ctx context.Context, mb Mailbox, log zerolog.Logg
 				return imported, err
 			}
 			if raw != nil {
-				ok, err := s.ingest(ctx, mb, raw, source, log)
+				ok, err := s.ingest(ctx, mb, raw, source, "", log)
 				if err != nil {
 					return imported, err
 				}
@@ -328,7 +344,7 @@ func (s *Service) markHandledIMAP(c *imapclient.Client, mb Mailbox, uid imap.UID
 // failure and skipped (nil error); only infrastructure errors (database
 // unreachable, cancelled) are returned, and then the run stops without
 // moving past the message.
-func (s *Service) ingest(ctx context.Context, mb Mailbox, raw []byte, source string, log zerolog.Logger) (bool, error) {
+func (s *Service) ingest(ctx context.Context, mb Mailbox, raw []byte, source, providerID string, log zerolog.Logger) (bool, error) {
 	if len(raw) > maxMessageBytes {
 		s.recordImportFailure(ctx, mb.ID, source, nil, int64(len(raw)), fmt.Sprintf("message is larger than %d MB", maxMessageBytes>>20))
 		return false, nil
@@ -339,6 +355,7 @@ func (s *Service) ingest(ctx context.Context, mb Mailbox, raw []byte, source str
 		s.recordImportFailure(ctx, mb.ID, source, nil, int64(len(raw)), "the message could not be parsed")
 		return false, nil
 	}
+	p.ProviderID = providerID
 	res, err := s.Import(ctx, mb, p, raw)
 	if err != nil {
 		// The server rejected this message's data: skip it. Anything else

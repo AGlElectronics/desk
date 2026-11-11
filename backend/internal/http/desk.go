@@ -119,11 +119,17 @@ func (h *deskHandler) deleteMailbox(w http.ResponseWriter, r *http.Request) {
 		httperror.Render(w, r, err)
 		return
 	}
-	if err := h.svc.DeleteMailbox(r.Context(), id); err != nil {
+	u, err := caller(r)
+	if err != nil {
 		httperror.Render(w, r, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	mb, err := h.svc.TrashMailbox(r.Context(), id, person(u))
+	if err != nil {
+		httperror.Render(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, mb)
 }
 
 func (h *deskHandler) testMailbox(w http.ResponseWriter, r *http.Request) {

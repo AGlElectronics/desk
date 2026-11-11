@@ -90,6 +90,9 @@ type ParsedMessage struct {
 	List bool
 	// Truncated is set when the message had more parts than Desk reads.
 	Truncated bool
+	// ProviderID is the message's id at the mail provider (Gmail), set by
+	// the fetcher.
+	ProviderID string
 }
 
 // Automatic reports whether the message was sent by a machine (auto-reply
@@ -435,10 +438,10 @@ func (s *Service) importTx(ctx context.Context, mb Mailbox, p *ParsedMessage, th
 	htmlBody, text := p.bodies(cids)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO threads (id, conversation_id, kind, from_email, to_emails, cc_emails, body_html, body_text,
-		                     message_id, raw_key, raw_size_bytes, auto_submitted)
-		VALUES ($1, $2, 'customer', $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		                     message_id, raw_key, raw_size_bytes, auto_submitted, provider_message_id)
+		VALUES ($1, $2, 'customer', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		threadID, convID, p.FromEmail, nonNil(p.To), nonNil(p.CC), htmlBody, text, p.MessageID,
-		rawKey, rawSize, auto); err != nil {
+		rawKey, rawSize, auto, p.ProviderID); err != nil {
 		return ImportResult{}, err
 	}
 	if err := attach(tx); err != nil {
