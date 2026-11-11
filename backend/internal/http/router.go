@@ -145,6 +145,7 @@ func NewRouter(deps Deps, version string) http.Handler {
 				secure.Post("/threads/{thread}/retry", handle(dh.retryThread))
 				secure.Delete("/threads/{thread}", handle(dh.deleteThread))
 				secure.Post("/threads/{thread}/restore", handle(dh.restoreThread))
+				secure.Get("/customers", handle(dh.searchCustomers))
 				secure.Get("/customers/{customer}", handle(dh.getCustomer))
 				secure.Patch("/customers/{customer}", handle(dh.updateCustomer))
 				secure.Post("/customers/{customer}/merge", handle(dh.mergeCustomer))

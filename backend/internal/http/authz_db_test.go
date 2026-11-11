@@ -225,6 +225,12 @@ func TestAuthorizationMatrix(t *testing.T) {
 	e.expect(outside, "PATCH", "/api/v1/customers/"+custID, map[string]any{"notes": "x"}, 404)
 	e.expect(manager, "PATCH", "/api/v1/customers/"+custID, map[string]any{"notes": "Prefers email"}, 200)
 	e.expect(manager, "PATCH", "/api/v1/customers/"+uuid.NewString(), map[string]any{"notes": "x"}, 404)
+	if got := e.expect(viewer, "GET", "/api/v1/customers?q=alice", nil, 200)["customers"].([]any); len(got) != 1 {
+		t.Fatalf("customer search %v", got)
+	}
+	if got := e.expect(viewer, "GET", "/api/v1/customers?q=bob", nil, 200)["customers"].([]any); len(got) != 0 {
+		t.Fatalf("bob writes to press only: %v", got)
+	}
 
 	// Delete role: trash and restore; others can't see the trash.
 	e.expect(deleter, "DELETE", "/api/v1/conversations/"+infoConv, nil, 200)

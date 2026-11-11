@@ -112,6 +112,44 @@ func (s *Service) CustomerProfile(ctx context.Context, a Access, id uuid.UUID) (
 	return p, err
 }
 
+// SearchCustomers finds customers by name or address among those with a
+// conversation in a mailbox the caller may view (Desk admins: their
+// organizations), at most 20.
+func (s *Service) SearchCustomers(ctx context.Context, a Access, q string) ([]Customer, error) {
+	q = strings.TrimSpace(q)
+	if len([]rune(q)) < 2 {
+		return []Customer{}, nil
+	}
+	visible, err := s.VisibleMailboxes(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]uuid.UUID, 0, len(visible))
+	for _, m := range visible {
+		ids = append(ids, m.ID)
+	}
+	like := "%" + escapeLike(q) + "%"
+	rows, err := s.pool.Query(ctx, `
+		SELECT cu.id, cu.email::text, cu.name, cu.notes FROM customers cu
+		 WHERE (cu.organization_id = ANY($1)
+		        OR EXISTS (SELECT 1 FROM conversations c WHERE c.customer_id = cu.id AND c.mailbox_id = ANY($2)))
+		   AND (cu.name ILIKE $3 OR EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = cu.id AND ce.email ILIKE $3))
+		 ORDER BY cu.name, cu.email LIMIT 20`, a.AdminOrgs(), ids, like)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Customer{}
+	for rows.Next() {
+		var c Customer
+		if err := rows.Scan(&c.ID, &c.Email, &c.Name, &c.Notes); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // CustomerInput changes a customer.
 type CustomerInput struct {
 	Name  *string `json:"name"`

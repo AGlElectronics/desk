@@ -669,6 +669,15 @@ func (h *deskHandler) restoreThread(r *http.Request) (int, any, error) {
 // Customers, attachments, people, tags, saved replies
 // ----------------------------------------------------------------------------
 
+func (h *deskHandler) searchCustomers(r *http.Request) (int, any, error) {
+	a, _, err := h.who(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	out, err := h.svc.SearchCustomers(r.Context(), a, r.URL.Query().Get("q"))
+	return http.StatusOK, map[string]any{"customers": out}, err
+}
+
 func (h *deskHandler) getCustomer(r *http.Request) (int, any, error) {
 	a, _, err := h.who(r)
 	if err != nil {
