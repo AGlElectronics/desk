@@ -75,7 +75,7 @@ func (e *apiEnv) call(w who, method, path string, body any) (int, map[string]any
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	raw, _ := io.ReadAll(res.Body)
 	out := map[string]any{}
 	_ = json.Unmarshal(raw, &out)
@@ -292,7 +292,7 @@ func TestAttachmentHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res.Body.Close()
+	_ = res.Body.Close()
 	if res.Header.Get("Content-Type") != "application/pdf" || !strings.HasPrefix(res.Header.Get("Content-Security-Policy"), "sandbox") ||
 		res.Header.Get("X-Content-Type-Options") != "nosniff" {
 		t.Fatalf("headers %v", res.Header)

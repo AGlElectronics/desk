@@ -389,8 +389,8 @@ func (c *Config) validate() []string {
 		errs = append(errs, "GOOGLE_FAKE needs GOOGLE_WORKSPACE_DOMAIN")
 	}
 
-	switch {
-	case c.S3Endpoint == "":
+	switch c.S3Endpoint {
+	case "":
 		errs = append(errs, "S3_ENDPOINT is required (attachments and raw mail are stored in S3)")
 	default:
 		if u, err := url.Parse(c.S3Endpoint); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {

@@ -126,14 +126,14 @@ func fakeSMTP(t *testing.T) (port int, got chan string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	got = make(chan string, 1)
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		r := bufio.NewReader(conn)
 		w := func(s string) { _, _ = conn.Write([]byte(s + "\r\n")) }
 		w("220 fake ESMTP")

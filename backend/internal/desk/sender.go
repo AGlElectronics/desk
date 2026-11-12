@@ -305,7 +305,7 @@ func (s *Service) sendSMTP(ctx context.Context, cfg SMTPSettings, from string, r
 	if err != nil {
 		return err
 	}
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 	if err := cl.Mail(from); err != nil {
 		return fmt.Errorf("MAIL FROM: %w", err)
 	}
@@ -387,22 +387,22 @@ func (s *Service) dialSMTP(ctx context.Context, cfg SMTPSettings) (*smtp.Client,
 	_ = conn.SetDeadline(time.Now().Add(sessionTimeout))
 	cl, err := smtp.NewClient(conn, cfg.Host)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	if cfg.Security == "starttls" {
 		if ok, _ := cl.Extension("STARTTLS"); !ok {
-			cl.Close()
+			_ = cl.Close()
 			return nil, displayError{msg: "the server does not offer STARTTLS"}
 		}
 		if err := cl.StartTLS(tlsCfg); err != nil {
-			cl.Close()
+			_ = cl.Close()
 			return nil, fmt.Errorf("starttls: %w", err)
 		}
 	}
 	if cfg.Username != "" {
 		if err := cl.Auth(plainAuth{username: cfg.Username, password: cfg.Password, allowPlaintext: cfg.Security == "none"}); err != nil {
-			cl.Close()
+			_ = cl.Close()
 			return nil, fmt.Errorf("%w (%v)", errLogin, err)
 		}
 	}
@@ -538,10 +538,14 @@ func buildMessage(m outgoing) ([]byte, error) {
 		}
 		enc := base64.StdEncoding.EncodeToString(a.Data)
 		for len(enc) > 76 {
-			fmt.Fprintf(pw, "%s\r\n", enc[:76])
+			if _, err := fmt.Fprintf(pw, "%s\r\n", enc[:76]); err != nil {
+				return nil, err
+			}
 			enc = enc[76:]
 		}
-		fmt.Fprintf(pw, "%s\r\n", enc)
+		if _, err := fmt.Fprintf(pw, "%s\r\n", enc); err != nil {
+			return nil, err
+		}
 	}
 	if err := mixed.Close(); err != nil {
 		return nil, err

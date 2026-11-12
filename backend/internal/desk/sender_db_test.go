@@ -225,7 +225,7 @@ func TestSendThroughGreenMail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 	if err := cl.Login(customer, customer).Wait(); err != nil {
 		t.Fatal(err)
 	}

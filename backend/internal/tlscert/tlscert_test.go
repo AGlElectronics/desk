@@ -145,7 +145,7 @@ func TestConfigure(t *testing.T) {
 			t.Fatalf("on=%v err=%v", on, err)
 		}
 		go func() { _ = srv.ServeTLS(ln, "", "") }()
-		defer srv.Close()
+		defer func() { _ = srv.Close() }()
 
 		client := &http.Client{Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // test certificate
@@ -154,7 +154,7 @@ func TestConfigure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if cn := resp.TLS.PeerCertificates[0].Subject.CommonName; cn != "served" {
 			t.Fatalf("served certificate %q, want served", cn)
 		}

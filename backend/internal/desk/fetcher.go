@@ -185,7 +185,7 @@ func (s *Service) dialIMAP(ctx context.Context, mb Mailbox) (*imapclient.Client,
 		_ = conn.SetDeadline(time.Now().Add(sessionTimeout))
 		c, err = imapclient.NewStartTLS(conn, &imapclient.Options{TLSConfig: tlsCfg})
 		if err != nil {
-			conn.Close()
+			_ = conn.Close()
 			return nil, fmt.Errorf("starttls: %w", err)
 		}
 	default:
@@ -197,7 +197,7 @@ func (s *Service) dialIMAP(ctx context.Context, mb Mailbox) (*imapclient.Client,
 		c = imapclient.New(conn, nil)
 	}
 	if err := c.Login(mb.IMAPUsername, password).Wait(); err != nil {
-		c.Close()
+		_ = c.Close()
 		return nil, fmt.Errorf("%w (%v)", errLogin, err)
 	}
 	return c, nil
@@ -220,7 +220,7 @@ func (s *Service) fetchIMAP(ctx context.Context, mb Mailbox, log zerolog.Logger)
 	if err != nil {
 		return 0, err
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	defer func() { _ = c.Logout().Wait() }()
 
 	sel, err := c.Select("INBOX", nil).Wait()
@@ -444,7 +444,7 @@ func (s *Service) TestConnection(ctx context.Context, id uuid.UUID, log zerolog.
 			out.IMAPOK = true
 		}
 		_ = c.Logout().Wait()
-		c.Close()
+		_ = c.Close()
 	}
 	cfg, err := s.smtpFor(ctx, mb)
 	if err != nil {

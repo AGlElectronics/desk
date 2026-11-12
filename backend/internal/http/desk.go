@@ -759,7 +759,7 @@ func (h *deskHandler) downloadAttachment(w http.ResponseWriter, r *http.Request)
 		httperror.Render(w, r, err)
 		return
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	ct, disposition := servedType(att.ContentType)
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))

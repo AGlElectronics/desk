@@ -47,7 +47,7 @@ func TestDialRefusesLoopback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
 
 	_, err = New(nil).Dial(context.Background(), "127.0.0.1", port, time.Second)
@@ -62,12 +62,12 @@ func TestDialRefusesLoopback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("allow-listed CIDR: %v", err)
 	}
-	conn.Close()
+	_ = conn.Close()
 	conn, err = New([]string{"localhost"}).Dial(context.Background(), "localhost", port, time.Second)
 	if err != nil {
 		t.Fatalf("allow-listed name: %v", err)
 	}
-	conn.Close()
+	_ = conn.Close()
 }
 
 func TestDescribeHidesDetails(t *testing.T) {

@@ -43,7 +43,7 @@ func New(t testing.TB) *pgxpool.Pool {
 	if err != nil {
 		t.Fatalf("connect %s: %v", EnvVar, err)
 	}
-	defer admin.Close(context.Background())
+	defer func() { _ = admin.Close(context.Background()) }()
 	buf := make([]byte, 6)
 	_, _ = rand.Read(buf)
 	schema := "t_" + hex.EncodeToString(buf)
