@@ -36,6 +36,7 @@ jobs:
       module: desk
       push: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
       version: ${{ inputs.version }}
+      den-major: "1"
       # Self-hosted runners (ARC scale set). On GitHub-hosted runners use:
       # runner: ubuntu-24.04, buildkit-endpoint: "", test-database-mode: service
       runner: arc-conservices

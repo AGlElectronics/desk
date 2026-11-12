@@ -26,7 +26,7 @@ name: desk
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine
     container_name: desk-postgres
     restart: unless-stopped
     environment:

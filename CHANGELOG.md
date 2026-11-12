@@ -15,10 +15,6 @@ counts rebuilds of the same version. Rebuilds get no entry here.
 
 ### Added
 
-- **BREAKING:** `AUTH_MODE` defaults to `oidc` and `APP_ENV` defaults to `production`. Set `APP_ENV=development` explicitly for local Compose and tests. `AUTH_MODE=dev` is refused outside development, and the `X-Dev-User` / `X-Dev-Groups` headers are removed and left out of CORS in every other mode.
-- **BREAKING:** the API accepts only an access token whose audience is `desk-api` (`OIDC_AUDIENCE`, that default). An ID token is refused. The web app keeps the access token in memory and signs in silently after a reload; it no longer sends the ID token. Point Keycloak's audience mapper at `desk-api` (the dev realm already does) and set `OIDC_AUDIENCE=desk-api`.
-- **BREAKING:** Google settings were renamed to the shared names. Use `GOOGLE_WORKSPACE_CREDENTIALS_FILE` and `GOOGLE_WORKSPACE_ADMIN_EMAIL`. The old names `GOOGLE_SERVICE_ACCOUNT_FILE` and `GOOGLE_ADMIN_USER` stop the backend from starting, with a message that names the new variable.
-- **BREAKING:** `GET /api/role-catalog` is no longer public. Call it with `HR_SERVICE_TOKEN` (at least 32 characters, the same value HR has) or with a staff access token. The catalog now sends `revision` (also the `ETag`; `If-None-Match` answers 304), `group_display`, `privileged` and `dynamic`. Delete roles and Desk admin are privileged; the three roles of each mailbox are dynamic.
 - Den portal to-dos: `GET /api/portal/todos`. Den's backend calls it with the pairing credential and `X-Den-User-Issuer` / `X-Den-User-Subject`. The answer is the open conversations assigned to that person. Not paired: 404. Wrong credential: 401. The chart admits `den-backend` from `conservices-den`.
 - Den link uses the shared client: `DEN_LINK_ENCRYPTION_KEY` (and `_PREVIOUS` while rotating) encrypts the stored credential, and `den_link.revoked_at` records a rejected credential. The Den connection card then says to pair again. SMTP and retention come from Den's module settings (`smtp.*`, `desk.retention.*`); when Den holds the SMTP password, Desk fetches it when sending and does not store it.
 - Per-mailbox roles are matched with `OIDC_GROUP_MATCH`, `OIDC_GROUP_PREFIX` and only the claim `OIDC_GROUPS_CLAIM`. Sign-in stores each group normalised and as the token sent it.
@@ -136,6 +132,15 @@ counts rebuilds of the same version. Rebuilds get no entry here.
 
 ### Changed
 
+- `OIDC_GROUPS_CLAIM`, `OIDC_GROUP_MATCH`, `OIDC_GROUP_PREFIX` and `DEN_ALLOWED_HOSTS` are in the configuration reference and `.env.example`.
+- Den's backend is admitted by `networkPolicy.den` (on by default). `allowFromNamespaces` no longer lists `conservices-den`.
+- CI passes `den-major: "1"`. A release whose MAJOR is not 1 is refused once the shared `ci-v1` tag points at the workflow that has that input.
+- Standalone Compose uses PostgreSQL `postgres:16.15-alpine`.
+- The Helm chart description says CI renders and lints the chart; the first production install is still pending.
+- **BREAKING:** `AUTH_MODE` defaults to `oidc` and `APP_ENV` defaults to `production`. Set `APP_ENV=development` explicitly for local Compose and tests. `AUTH_MODE=dev` is refused outside development, and the `X-Dev-User` / `X-Dev-Groups` headers are removed and left out of CORS in every other mode.
+- **BREAKING:** the API accepts only an access token whose audience is `desk-api` (`OIDC_AUDIENCE`, that default). An ID token is refused. The web app keeps the access token in memory and signs in silently after a reload; it no longer sends the ID token. Point Keycloak's audience mapper at `desk-api` (the dev realm already does) and set `OIDC_AUDIENCE=desk-api`.
+- **BREAKING:** Google settings were renamed to the shared names. Use `GOOGLE_WORKSPACE_CREDENTIALS_FILE` and `GOOGLE_WORKSPACE_ADMIN_EMAIL`. The old names `GOOGLE_SERVICE_ACCOUNT_FILE` and `GOOGLE_ADMIN_USER` stop the backend from starting, with a message that names the new variable.
+- **BREAKING:** `GET /api/role-catalog` is no longer public. Call it with `HR_SERVICE_TOKEN` (at least 32 characters, the same value HR has) or with a staff access token. The catalog now sends `revision` (also the `ETag`; `If-None-Match` answers 304), `group_display`, `privileged` and `dynamic`. Delete roles and Desk admin are privileged; the three roles of each mailbox are dynamic.
 - **Action required:** in the Google Admin console, open **Security → Access and data control → API controls → Domain-wide delegation**, edit the Desk service account's client ID, and add this scope (leave the scopes already there):
 
   `https://www.googleapis.com/auth/gmail.settings.sharing`
