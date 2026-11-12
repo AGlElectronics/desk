@@ -332,7 +332,9 @@ func (f *Fake) Send(_ context.Context, user string, raw []byte) (string, error) 
 func (f *Fake) Trash(_ context.Context, user, id string) error { return f.setTrashed(user, id, true) }
 
 // Untrash implements Mail.
-func (f *Fake) Untrash(_ context.Context, user, id string) error { return f.setTrashed(user, id, false) }
+func (f *Fake) Untrash(_ context.Context, user, id string) error {
+	return f.setTrashed(user, id, false)
+}
 
 func (f *Fake) setTrashed(user, id string, v bool) error {
 	f.mu.Lock()
