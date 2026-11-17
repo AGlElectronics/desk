@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Development helpers against GreenMail: the standalone Compose stack also
+  defines `info@desk.test`. Platform scripts
+  `scripts/seed-desk-mailboxes.ps1` and `scripts/send-desk-test-mail.ps1`
+  (in `con-services`) create Support and Info IMAP mailboxes and inject
+  fake customer mail without sending real email. Documented under
+  [Development on Docker](https://aglelectronics.github.io/con-services/modules/desk/setup/#option-4-development-on-docker).
+
 ## [1.0.0] - 2026-11-12
 
 Needs Den: 1.0.0 or later (Den MAJOR 1).
