@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- `STATS_PULL_TOKEN`, when set, must be at least 32 characters (same bar as
+  HR service tokens). Empty still disables the internal stats route.
+
 ### Added
 
 - Development helpers against GreenMail: the standalone Compose stack also

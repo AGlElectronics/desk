@@ -328,6 +328,9 @@ func (c *Config) validate() []string {
 	if t := c.HRServiceToken; t != "" && len(t) < MinServiceTokenLength {
 		errs = append(errs, fmt.Sprintf("HR_SERVICE_TOKEN must be at least %d characters (openssl rand -base64 32)", MinServiceTokenLength))
 	}
+	if t := c.StatsPullToken; t != "" && len(t) < MinServiceTokenLength {
+		errs = append(errs, fmt.Sprintf("STATS_PULL_TOKEN must be at least %d characters (openssl rand -hex 32)", MinServiceTokenLength))
+	}
 
 	switch {
 	case c.SecretKey == "":
