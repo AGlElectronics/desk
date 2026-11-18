@@ -1,4 +1,4 @@
-﻿// Package config loads and validates the backend runtime configuration from
+// Package config loads and validates the backend runtime configuration from
 // environment variables (12-factor). Validation runs once at startup and
 // fails loudly: a misconfigured deployment is better than a silently
 // degraded one.
@@ -77,7 +77,8 @@ type Config struct {
 	GroupMatch groupmatch.Config
 	// HRServiceToken lets HR read GET /api/role-catalog without a sign-in
 	// (HR_SERVICE_TOKEN). Empty: only signed-in staff may read it.
-	HRServiceToken string
+	HRServiceToken string
+
 	// StatsPullToken protects GET /api/internal/stats for Stats. Empty disables it.
 	StatsPullToken string
 
@@ -266,8 +267,9 @@ func load(lookup func(string) (string, bool)) (*Config, error) {
 		DevDefaultUser:   env("DEV_DEFAULT_USER", "dev-admin"),
 		DevDefaultGroups: splitCSV(env("DEV_DEFAULT_GROUPS", "desk-admin")),
 		GroupMatch:       groups,
-		HRServiceToken:   env("HR_SERVICE_TOKEN", ""),
-		StatsPullToken:    strings.TrimSpace(env("STATS_PULL_TOKEN", "")),
+		HRServiceToken:   env("HR_SERVICE_TOKEN", ""),
+
+		StatsPullToken: strings.TrimSpace(env("STATS_PULL_TOKEN", "")),
 
 		BrandLocalPath: env("BRAND_LOCAL_PATH", ""),
 		Den:            den,
