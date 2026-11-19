@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Frontend nginx base image moved to `nginx/nginx-unprivileged:1.30.7-alpine` (fixes nginx CRITICAL/HIGH CVEs including CVE-2026-121810; old `nginxinc/` registry no longer publishes 1.30.7).
+
 - `STATS_PULL_TOKEN`, when set, must be at least 32 characters (same bar as
   HR service tokens). Empty still disables the internal stats route.
 
