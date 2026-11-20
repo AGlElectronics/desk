@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Bumped `golang.org/x/crypto` to v0.59.0 (GO-2026-5932 / openpgp).
+- Dockerfiles declare `HEALTHCHECK`: backends probe `/livez` via
+  `<binary> healthcheck` (distroless has no curl); frontends use `wget` on
+  `:8080`; migrators use `HEALTHCHECK NONE`.
+
 - Frontend nginx base image moved to `nginx/nginx-unprivileged:1.30.7-alpine` (fixes nginx CRITICAL/HIGH CVEs including CVE-2026-121810; old `nginxinc/` registry no longer publishes 1.30.7).
 
 - `STATS_PULL_TOKEN`, when set, must be at least 32 characters (same bar as

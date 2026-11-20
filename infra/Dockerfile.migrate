@@ -26,3 +26,5 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/migrate /migrate
 USER nonroot:nonroot
 ENTRYPOINT ["/migrate"]
+# One-shot migrator: never stays running, so Docker health checks are off.
+HEALTHCHECK NONE

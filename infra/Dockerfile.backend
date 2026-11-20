@@ -35,3 +35,6 @@ COPY --from=build /out/server /server
 EXPOSE 8080
 USER nonroot:nonroot
 ENTRYPOINT ["/server"]
+# Distroless has no curl/wget: the binary probes its own /livez.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["/server", "healthcheck"]
