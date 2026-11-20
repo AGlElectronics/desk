@@ -32,7 +32,7 @@ RUN npm run build
 # a non-root process cannot bind ports below 1024. The pid file and the
 # temporary files live in /tmp. The upgrade picks up Alpine security fixes
 # published after the base image was built.
-FROM nginxinc/nginx-unprivileged:1.30.6-alpine AS runtime
+FROM nginx/nginx-unprivileged:1.30.7-alpine AS runtime
 USER root
 RUN apk upgrade --no-cache
 COPY --from=build /src/dist /usr/share/nginx/html
@@ -65,3 +65,6 @@ ENV NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx/snippets \
     EXTRA_CONNECT_SRC="" \
     EXTRA_FRAME_SRC="about:srcdoc"
 EXPOSE 8080
+# Image-level health check (Compose/K8s still use their own probes).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD wget -q --spider http://127.0.0.1:8080/ || exit 1

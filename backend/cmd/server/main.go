@@ -15,9 +15,19 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/AGlElectronics/desk/backend/internal/app"
+	"github.com/AGlElectronics/desk/backend/internal/probe"
 )
 
 func main() {
+	// `server healthcheck` probes the running server's /livez
+	// (Docker HEALTHCHECK / Compose; the image has no curl).
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		addr := os.Getenv("HTTP_ADDR")
+		if addr == "" {
+			addr = ":8080"
+		}
+		probe.Run(addr)
+	}
 	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
 	zerolog.TimeFieldFormat = time.RFC3339
 

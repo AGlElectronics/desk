@@ -119,6 +119,7 @@ func NewRouter(deps Deps, version string) http.Handler {
 			gated.Use(den.RequirePaired)
 			gated.Get("/health", health.get)
 			gated.Get("/role-catalog", roleCatalogAuth(deps.Config.HRServiceToken, authMW, roleCatalogHandler(deps.Access, deps.Desk)))
+			gated.Get("/internal/stats", internalStatsHandler(deps.Config.StatsPullToken, deps.Pool))
 			gated.Get("/den/state", den.StateHandler)
 
 			gated.Route("/v1", func(v1 chi.Router) {

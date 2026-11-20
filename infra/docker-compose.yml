@@ -75,7 +75,9 @@ services:
 
   # DEV ONLY mail server. Mail sent to any address over SMTP is delivered;
   # these mailboxes can log in over IMAP (login = full address, password =
-  # the part before the @): support@desk.test, registration@desk.test.
+  # the part before the @): support@desk.test, registration@desk.test,
+  # info@desk.test. support@ and info@ are the durable seed targets;
+  # registration@ is left for smoke.
   greenmail:
     image: greenmail/standalone:latest
     container_name: desk-greenmail
@@ -84,7 +86,7 @@ services:
       GREENMAIL_OPTS: >-
         -Dgreenmail.setup.test.all
         -Dgreenmail.hostname=0.0.0.0
-        -Dgreenmail.users=support:support@desk.test,registration:registration@desk.test
+        -Dgreenmail.users=support:support@desk.test,registration:registration@desk.test,info:info@desk.test
         -Dgreenmail.users.login=email
     ports:
       - "3025:3025"

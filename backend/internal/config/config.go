@@ -79,6 +79,9 @@ type Config struct {
 	// (HR_SERVICE_TOKEN). Empty: only signed-in staff may read it.
 	HRServiceToken string
 
+	// StatsPullToken protects GET /api/internal/stats for Stats. Empty disables it.
+	StatsPullToken string
+
 	// Brand provider
 	BrandLocalPath string // optional brand.json; Den's brand overlays it once paired
 	// Den is the pairing configuration (DEN_MODE, DEN_INTERNAL_URL,
@@ -266,6 +269,8 @@ func load(lookup func(string) (string, bool)) (*Config, error) {
 		GroupMatch:       groups,
 		HRServiceToken:   env("HR_SERVICE_TOKEN", ""),
 
+		StatsPullToken: strings.TrimSpace(env("STATS_PULL_TOKEN", "")),
+
 		BrandLocalPath: env("BRAND_LOCAL_PATH", ""),
 		Den:            den,
 
@@ -322,6 +327,9 @@ func (c *Config) validate() []string {
 	}
 	if t := c.HRServiceToken; t != "" && len(t) < MinServiceTokenLength {
 		errs = append(errs, fmt.Sprintf("HR_SERVICE_TOKEN must be at least %d characters (openssl rand -base64 32)", MinServiceTokenLength))
+	}
+	if t := c.StatsPullToken; t != "" && len(t) < MinServiceTokenLength {
+		errs = append(errs, fmt.Sprintf("STATS_PULL_TOKEN must be at least %d characters (openssl rand -hex 32)", MinServiceTokenLength))
 	}
 
 	switch {
